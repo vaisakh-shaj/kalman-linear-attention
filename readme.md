@@ -39,12 +39,14 @@ python -m kla            # prints which scan backends this machine can use
 ```
 
 ```
-kla 0.1.0   torch 2.13.0+cu130   device: cpu
+kla 0.1.0   torch 2.12.0+cu130   device: cpu
 backend='auto' resolves to: torch
 
   [x] torch   always available; the reference implementation
   [ ] triton  needs a CUDA device
   [ ] cuda    needs a CUDA device
+
+  log-space scan on: torch
 
   forward check: KLALayer(64) -> (2, 16, 64), 63,105 params   OK
 ```
@@ -62,7 +64,8 @@ y = layer(torch.randn(2, 1024, 512))        # -> [2, 1024, 512]
 ```
 
 Same in/out shape as attention, so it slots into an existing block unchanged.
-It runs on CPU; on a GPU it picks the fastest available kernel by itself.
+It runs on CPU; on a CUDA device it switches to the fused triton kernel by
+itself.
 
 <table>
 <tr>
@@ -129,18 +132,17 @@ they are interchangeable.
 
 | variant | what changes | how to build it |
 |---|---|---|
-| **plain** *(default)* | used for the paper's **synthetic experiments** | `KLALayer(d, KLAConfig())` |
-| **mamba block** | value comes straight from the conv (as in Mamba) and the observation noise goes through a low-rank bottleneck. **~Mamba's parameter count**, and what the paper's **large-scale pretraining** uses | `KLALayer(d, KLAConfig(value_rank="conv", var_rank="dt"))` |
+| **plain** *(default)* | full-width value and observation noise | `KLALayer(d, KLAConfig())` |
+| **mamba block** | value comes straight from the conv (as in Mamba); observation noise goes through a low-rank bottleneck | `KLALayer(d, KLAConfig(value_rank="conv", var_rank="dt"))` |
 
-**Which one?** Both ship because both were used, and either reproduces the
-results it belongs to: the MAD synthetic experiments are **plain**, the
-pretraining runs are the **mamba block**. Quality is comparable between them, so
-this is not an accuracy trade-off - pick on parameter budget.
+**Which one?** Both ship because both were used - the MAD synthetic experiments
+are **plain**, the pretraining runs are the **mamba block** - and either
+reproduces the results it belongs to. Quality is comparable, so this is not an
+accuracy trade-off: pick on parameter budget.
 
 That makes **mamba block** the one to reach for at scale, where the point is to
 match Mamba's parameter count and state size at equal width: at `d_model=512` it
-is 1.73M parameters against plain's 3.76M for the same widths, and the gap grows
-with `d_model`.
+is 1.73M parameters against plain's 3.76M, and the gap grows with `d_model`.
 
 Neither changes the scan: both emit the same shapes, so every backend runs both.
 
@@ -210,29 +212,22 @@ one of the other ways the Möbius scan can be implemented.
 
 The CUDA kernels are compiled on first use and need `nvcc`; everything else needs
 nothing. Anything outside their supported subset raises a clear error rather than
-silently computing the wrong thing.
-
-Two of them ship. `backend="cuda"` selects `v2_2`, which computes exactly what
-torch and triton compute and leaves bounding the inputs to you (`obs_var_min` /
-`obs_var_max`, `qk_norm` / `clip_value`). `backend="cuda_v2_1"` selects a variant
-that additionally clamps the per-token information gain, which holds the
-posterior variance on a shorter leash on badly-scaled inputs - useful, but not
-mathematically exact, since the clamp breaks a cancellation that the posterior
-mean relies on. Details in
+silently computing the wrong thing. Two ship - `backend="cuda"` is the exact one,
+`"cuda_v2_1"` adds a clamp that bounds the variance harder at the cost of
+exactness - documented in
 [src/kla/ops/cuda_backend.py](src/kla/ops/cuda_backend.py).
 
 ---
 
 ## What this package is not
 
-Deliberately just the layer. No training loop, no benchmark harness, no
-experiment code, no dataset glue. It is meant to be imported into whatever you
+The installable package is deliberately just the layer. No training loop, no
+benchmark harness, no dataset glue - it is meant to be imported into whatever you
 already have.
 
-Reproduction code lives in a separate repository. It currently covers the
-**MAD** synthetic-task suite ([mad-lab](https://github.com/athms/mad-lab)) - the
-paper's `plain`-block experiments. The **FineWeb** pretraining runs behind the
-`mamba`-block results are not in it yet; they will follow.
+Reproduction code for the paper's experiments is coming to this repo: the **MAD**
+synthetic tasks ([mad-lab](https://github.com/athms/mad-lab)) behind the `plain`
+results, and **FineWeb-Edu** pretraining behind the `mamba` results.
 
 Not published to PyPI - install from source as above.
 
