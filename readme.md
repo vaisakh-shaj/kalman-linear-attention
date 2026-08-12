@@ -1,15 +1,23 @@
 # KLA - Kalman Linear Attention
 
-A sequence-mixing layer that is an **exact parallel Kalman filter**. Linear in
-sequence length, no attention matrix.
+A sequence-mixing layer that is an **exact parallel Kalman filter**: it carries a
+belief rather than a point estimate, and updates it in closed form as the
+sequence arrives.
 
-What sets it apart: KLA **propagates uncertainty through the recurrence itself**,
-and that recurrence is **non-linear** - the posterior precision evolves through a
-Möbius (linear-fractional) map alongside the state. Ordinary linear attention and
-SSMs carry a *linear* state recurrence and emit a point estimate, so there is
-nothing to read an uncertainty off. Here every output channel comes with its own
-variance: **explicit, interpretable uncertainty neurons**, one per channel per
-token, at no extra cost, because the filter has to compute them anyway.
+| | Softmax attention | SSMs / GLA | **KLA** |
+|---|---|---|---|
+| Expressivity | nonlinear | linear | **fractional linear (Möbius)** |
+| Training | `O(T²)` | `O(T)` | `O(T)` |
+| Inference | `O(T)` | `O(1)` | `O(1)` |
+| Sequence uncertainty | ❌ | ❌ | ✅ |
+| Parallel training | ✅ | ✅ | ✅ |
+
+It keeps the efficiency of an SSM while the state update itself is **non-linear**
+- the posterior precision evolves through a Möbius (linear-fractional) map
+alongside the mean. Ordinary linear attention and SSMs carry a *linear*
+recurrence and emit a point estimate, so there is nothing to read an uncertainty
+off. Here the last row comes for free, because the filter has to compute it
+anyway.
 
 Drop it in wherever you would put attention or a Mamba block.
 
