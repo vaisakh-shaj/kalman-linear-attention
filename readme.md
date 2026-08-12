@@ -25,9 +25,9 @@ Drop it in wherever you would put attention or a Mamba block.
 
 The outer shell (grey) is the scaffolding every gated linear attention /
 deterministic SSM block already has, so it is a drop-in replacement. Inside, the
-**red stream is the one no other linear mixer has**. It is not a
+**blue stream is the one no other linear mixer has**. It is not a
 side-channel: the Kalman gain `alpha_t` is a function of the model's own current
-uncertainty, so the red stream feeds back into the mean, and it is carried all
+uncertainty, so the blue stream feeds back into the mean, and it is carried all
 the way to the output through the squared gate and squared output weights. That
 is what "uncertainty propagated through the recurrence" means, concretely.
 

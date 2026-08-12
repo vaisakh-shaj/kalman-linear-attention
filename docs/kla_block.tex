@@ -3,10 +3,12 @@
 %   mv kla_block-1.png kla_block.png
 % The same macro (\tikzKLABlock) is the block figure in the paper.
 \documentclass[11pt]{article}
-\usepackage[margin=0.6cm,paperwidth=24cm,paperheight=7.8cm]{geometry}
+\usepackage[margin=0.6cm,paperwidth=24cm,paperheight=8.6cm]{geometry}
 \usepackage{tikz}
 \usepackage{amsmath}
 \usepackage{amssymb}
+% The uncertainty stream's colour, used for every element of it.
+\definecolor{uncol}{RGB}{21,101,192}
 \usetikzlibrary{positioning,arrows.meta,calc,decorations.pathmorphing,fit,backgrounds}
 \pagestyle{empty}
 
@@ -16,11 +18,11 @@
     x=1cm, y=1cm,
     shd/.style={draw, thick, rounded corners=3pt, fill=gray!8, align=center,
                 font=\small, minimum height=0.85cm, inner sep=3.5pt},
-    unc/.style={draw=red!80, thick, rounded corners=3pt, fill=red!6, align=center,
-                font=\small, text=red!80, minimum height=0.85cm, inner sep=3.5pt},
+    unc/.style={draw=uncol, thick, rounded corners=3pt, fill=uncol!8, align=center,
+                font=\small, text=uncol, minimum height=0.85cm, inner sep=3.5pt},
     io/.style={align=center, font=\small},
     ar/.style={->, thick, >=stealth},
-    arr/.style={->, thick, >=stealth, draw=red!80},
+    arr/.style={->, thick, >=stealth, draw=uncol},
 ]
 \def\yb{0}      % mean lane
 \def\yr{-3.1}   % uncertainty lane
@@ -35,17 +37,17 @@
 \draw[ar] (inp.south) -- (gt.north);
 
 % ================================================ sensors
-\node[shd, font=\scriptsize] (sm) at (6.6,\yb)
+\node[shd, font=\scriptsize] (sm) at (6.4,\yb)
      {$\mathbf{v},\,\mathbf{k},\mathbf{q}$};
-\node[unc, font=\scriptsize] (su) at (6.6,\yr)
+\node[unc, font=\scriptsize] (su) at (6.4,\yr)
      {$\boldsymbol{\Lambda}^{\mathrm v},\,\mathbf{k},\mathbf{q}$};
 \draw[ar]  (z) -- (sm);
 \draw[arr] (z) -- (su);
 
 % ================================================ sufficient statistics
-\node[shd, font=\scriptsize] (r)   at (9.1,\yb)
+\node[shd, font=\scriptsize] (r)   at (8.85,\yb)
      {$\mathbf{r}=(\mathbf{v}\boldsymbol{\Lambda}^{\mathrm v})\!\otimes\!\mathbf{k}$};
-\node[unc, font=\scriptsize] (phi) at (9.1,\yr)
+\node[unc, font=\scriptsize] (phi) at (8.85,\yr)
      {$\boldsymbol{\varphi}=\boldsymbol{\Lambda}^{\mathrm v}\!\otimes\!\mathbf{k}^{2}$};
 \draw[ar]  (sm)  -- (r);
 \draw[arr] (su)  -- (phi);
@@ -53,27 +55,27 @@
 % ================================================ the two recurrences
 \node[shd] (eta) at (12.6,\yb) {\textbf{information}\\[-1pt]
      {\scriptsize$\boldsymbol{\eta}_t=\alpha_t\boldsymbol{\eta}_{t-1}+\mathbf{r}_t$}\\[-3pt]
-     {\scriptsize\itshape affine in $\boldsymbol{\eta}$}};
+     {\footnotesize\itshape affine in $\boldsymbol{\eta}$}};
 \node[unc] (lam) at (12.6,\yr) {\textbf{precision}\\[-1pt]
      {\scriptsize$\boldsymbol{\lambda}_t=\dfrac{A\boldsymbol{\lambda}_{t-1}+B}
                                             {C\boldsymbol{\lambda}_{t-1}+D}$}\\[-3pt]
-     {\scriptsize\itshape fractional-linear $\Rightarrow$ non-linear}};
+     {\footnotesize\itshape fractional-linear $\Rightarrow$ non-linear}};
 \draw[ar]  (r)   -- (eta);
 \draw[arr] (phi) -- (lam);
 
 % ==== THE coupling: the Kalman gain is a function of the model's own uncertainty
-\node[draw=red!80, thick, rounded corners=2pt, fill=white, font=\scriptsize,
-      text=red!80, align=center, inner sep=3pt] (gain) at (12.6,{(\yb+\yr)/2})
+\node[draw=uncol, thick, rounded corners=2pt, fill=white, font=\scriptsize,
+      text=uncol, align=center, inner sep=3pt] (gain) at (12.6,{(\yb+\yr)/2})
      {$\alpha_t=\dfrac{a}{a^{2}+p\,\boldsymbol{\lambda}_{t-1}}$};
 \draw[arr, line width=1.3pt] (lam.north) -- (gain.south);
 \draw[arr, line width=1.3pt] (gain.north) -- (eta.south);
-\node[font=\scriptsize\itshape, text=red!80, anchor=west, align=left]
+\node[font=\small\itshape, text=uncol, anchor=west, align=left]
       at (14.35,{(\yb+\yr)/2}) {the gain is driven by\\the model's own uncertainty};
 
 % ================================================ read-out
-\node[shd, font=\scriptsize] (y)  at (17.0,\yb)
-     {$\mathbf{y}=\sum_s\mathbf{q}\,\boldsymbol{\eta}/{\color{red!80}\boldsymbol{\lambda}}$};
-\node[unc, font=\scriptsize] (yv) at (17.0,\yr)
+\node[shd, font=\scriptsize] (y)  at (17.2,\yb)
+     {$\mathbf{y}=\sum_s\mathbf{q}\,\boldsymbol{\eta}/{\color{uncol}\boldsymbol{\lambda}}$};
+\node[unc, font=\scriptsize] (yv) at (17.2,\yr)
      {$\mathbf{y}_{\mathrm{var}}=\sum_s\mathbf{q}^{2}/\boldsymbol{\lambda}$};
 \draw[ar]  (eta) -- (y);
 \draw[arr] (lam) -- (yv);
@@ -91,16 +93,16 @@
 \draw[arr] (gyv) -- (wyv);
 
 \node[io] (out)  at (22.4,\yb) {$\mathbf{out}$};
-\node[io, text=red!80] (outv) at (22.4,\yr) {$\mathbf{out}_{\mathrm{var}}$};
+\node[io, text=uncol] (outv) at (22.4,\yr) {$\mathbf{out}_{\mathrm{var}}$};
 \draw[ar]  (wy)  -- (out);
 \draw[arr] (wyv) -- (outv);
 
 % ================================================ lane labels + legend
-\node[font=\small\itshape, anchor=south] at (9.1,{\yb+0.62}) {mean};
-\node[font=\small\itshape, text=red!80, anchor=north] at (9.1,{\yr-0.62}) {uncertainty};
-\node[font=\scriptsize, anchor=west] at (0,{\yr-2.15})
+\node[font=\large\itshape, anchor=south] at (8.85,{\yb+0.62}) {mean};
+\node[font=\large\itshape, text=uncol, anchor=north] at (8.85,{\yr-0.62}) {uncertainty};
+\node[font=\small, anchor=west] at (0,{\yr-2.15})
      {\textbf{Legend:}\; black = shared with gated linear attention / deterministic SSMs \quad
-      {\color{red!80}\textbf{red} = KLA-only (uncertainty)}};
+      {\color{uncol}\textbf{blue} = KLA-only (uncertainty)}};
 \end{tikzpicture}
 }
 
