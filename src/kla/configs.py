@@ -16,9 +16,10 @@ MobiusImpl = Literal["linear", "log"]
 
 # How a d_inner-wide sensor signal is produced from the post-conv stream z.
 #   "full"  one Linear(M, M): no bottleneck. The published architecture.
-#   "dt"    low rank M -> r -> M, r = dt_rank or ceil(d_model/16). Mamba's
-#           convention for dt_proj, which occupies the same slot (Delta is the
-#           only d_inner-wide control signal Mamba has).
+#   "dt"    low rank M -> r -> M, r = dt_rank or ceil(d_model/8). Named after
+#           Mamba's dt_proj, which occupies the same slot (Delta is the only
+#           d_inner-wide control signal Mamba has); the rank is twice Mamba's
+#           own ceil(d_model/16), since sigma^2_v carries more than a timescale.
 #   int     that rank explicitly. Only *saves* when 2*rank < d_inner.
 #   "conv"  (value only) v = z, no projection at all. Mamba's move.
 Rank = Union[int, Literal["full", "dt"]]
@@ -156,7 +157,7 @@ class KLAConfig:
 
     dt_rank: Optional[int] = None
     """Rank used by the ``"dt"`` setting of ``value_rank`` / ``var_rank``
-    (Mamba's dt_rank convention). None = ceil(d_model / 16)."""
+    (named after Mamba's dt_rank). None = ceil(d_model / 8)."""
 
     # --- numerics ----------------------------------------------------------
     clip_value: Optional[float] = None

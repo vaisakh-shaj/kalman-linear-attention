@@ -68,7 +68,7 @@ class KLALayer(nn.Module):
         # all (v = z, Mamba's move). Only the WIDTHS of this one Linear change;
         # the four outputs keep their shapes, so nothing downstream of here
         # (scan, backward, any backend) is affected.
-        auto_rank = config.dt_rank or math.ceil(d_model / 16)
+        auto_rank = config.dt_rank or math.ceil(d_model / 8)
         self._value_rank = auto_rank if config.value_rank == "dt" else config.value_rank
         self._var_rank = auto_rank if config.var_rank == "dt" else config.var_rank
 

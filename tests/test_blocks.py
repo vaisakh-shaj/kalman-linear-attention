@@ -81,7 +81,7 @@ def test_plain_is_the_published_default():
 
 
 def test_mamba_block_is_cheaper_and_wired_right():
-    M, r = 2 * D, math.ceil(D / 16)
+    M, r = 2 * D, math.ceil(D / 8)
     m = KLALayer(D, _cfg(**MAMBA))
     assert m.sensor_proj.out_features == r + 2 * S      # no value slice at all
     assert m.value_expand is None                        # v = z, nothing to lift

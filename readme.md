@@ -150,7 +150,7 @@ accuracy trade-off: pick on parameter budget.
 
 That makes **mamba block** the one to reach for at scale, where the point is to
 match Mamba's parameter count and state size at equal width: at `d_model=512` it
-is 1.73M parameters against plain's 3.76M, and the gap grows with `d_model`.
+is 1.79M parameters against plain's 3.76M, and the gap grows with `d_model`.
 
 Neither changes the scan: both emit the same shapes, so every backend runs both.
 
@@ -161,7 +161,7 @@ plain  = KLALayer(512, KLAConfig(d_state=16))
 mamba  = KLALayer(512, KLAConfig(d_state=16, value_rank="conv", var_rank="dt"))
 ```
 
-`"dt"` resolves to `ceil(d_model/16)` - Mamba's `dt_rank` convention. You can
+`"dt"` resolves to `ceil(d_model/8)`, named after Mamba's `dt_rank` slot. You can
 also pass an integer for an explicit rank.
 
 ---
