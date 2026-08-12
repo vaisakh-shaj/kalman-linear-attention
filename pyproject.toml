@@ -1,0 +1,45 @@
+[project]
+name = "kla"
+version = "0.1.0"
+description = "Kalman Linear Attention (KLA): a linear-attention layer that runs an exact parallel Kalman filter, propagating uncertainty through a non-linear recurrence to give explicit per-channel uncertainty alongside every output."
+readme = "readme.md"
+requires-python = ">=3.10"
+license = "MIT"
+# uv_build does NOT bundle LICENSE automatically — without this the wheel ships
+# `License-Expression: MIT` and no license text.
+license-files = ["LICENSE"]
+authors = [
+    { name = "Vaisakh Shaj", email = "vaisakhs.shaj@gmail.com" },
+    { name = "Cameron Barker", email = "cameronbarkeran@gmail.com" },
+    { name = "Aidan Scannell", email = "aidan.scannell@ed.ac.uk" },
+    { name = "Andras Szecsenyi", email = "andras.szecsenyi@gmail.com" },
+]
+keywords = ["machine learning", "attention", "neural networks", "pytorch", "llm", "ssm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Deliberately torch-only. The scan falls back to pure PyTorch, triton is
+# imported lazily (it ships with the Linux torch wheel), and the CUDA kernels
+# are compiled on first use only if you ask for backend="cuda". So there is no
+# build step and no CUDA toolchain needed to install or to run.
+dependencies = ["torch>=2.8"]
+
+[project.urls]
+Homepage = "https://github.com/vaisakh-shaj/kalman-linear-attention"
+Repository = "https://github.com/vaisakh-shaj/kalman-linear-attention"
+Issues = "https://github.com/vaisakh-shaj/kalman-linear-attention/issues"
+Paper = "https://arxiv.org/abs/2602.10743"
+
+[build-system]
+requires = ["uv_build>=0.11.16,<0.12"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: finite-difference gradchecks; deselect with -m 'not slow'"]

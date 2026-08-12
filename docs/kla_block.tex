@@ -1,0 +1,110 @@
+% Figure used in the readme. Regenerate with:
+%   pdflatex kla_block.tex && pdftoppm -png -r 150 kla_block.pdf kla_block
+%   mv kla_block-1.png kla_block.png
+% The same macro (\tikzKLABlock) is the block figure in the paper.
+\documentclass[11pt]{article}
+\usepackage[margin=0.6cm,paperwidth=24cm,paperheight=7.8cm]{geometry}
+\usepackage{tikz}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usetikzlibrary{positioning,arrows.meta,calc,decorations.pathmorphing,fit,backgrounds}
+\pagestyle{empty}
+
+% ---------------------------------------------------------------- the macro
+\newcommand{\tikzKLABlock}{
+\begin{tikzpicture}[
+    x=1cm, y=1cm,
+    shd/.style={draw, thick, rounded corners=3pt, fill=gray!8, align=center,
+                font=\small, minimum height=0.85cm, inner sep=3.5pt},
+    unc/.style={draw=red!80, thick, rounded corners=3pt, fill=red!6, align=center,
+                font=\small, text=red!80, minimum height=0.85cm, inner sep=3.5pt},
+    io/.style={align=center, font=\small},
+    ar/.style={->, thick, >=stealth},
+    arr/.style={->, thick, >=stealth, draw=red!80},
+]
+\def\yb{0}      % mean lane
+\def\yr{-3.1}   % uncertainty lane
+
+% ================================================ shared shell (grey, small)
+\node[io]  (x)   at (0,\yb-1.55) {$\mathbf{x}$};
+\node[shd] (inp) at (1.7,\yb-1.55) {\texttt{in\_proj}};
+\node[shd] (cv)  at (3.5,\yb-1.55) {conv};
+\node[io]  (z)   at (4.8,\yb-1.55) {$\mathbf{z}$};
+\draw[ar] (x) -- (inp);  \draw[ar] (inp) -- (cv);  \draw[ar] (cv) -- (z);
+\node[shd, font=\scriptsize, minimum height=0.6cm] (gt) at (1.7,\yb-3.6) {gate $g$};
+\draw[ar] (inp.south) -- (gt.north);
+
+% ================================================ sensors
+\node[shd, font=\scriptsize] (sm) at (6.6,\yb)
+     {$\mathbf{v},\,\mathbf{k},\mathbf{q}$};
+\node[unc, font=\scriptsize] (su) at (6.6,\yr)
+     {$\boldsymbol{\Lambda}^{\mathrm v},\,\mathbf{k},\mathbf{q}$};
+\draw[ar]  (z) -- (sm);
+\draw[arr] (z) -- (su);
+
+% ================================================ sufficient statistics
+\node[shd, font=\scriptsize] (r)   at (9.1,\yb)
+     {$\mathbf{r}=(\mathbf{v}\boldsymbol{\Lambda}^{\mathrm v})\!\otimes\!\mathbf{k}$};
+\node[unc, font=\scriptsize] (phi) at (9.1,\yr)
+     {$\boldsymbol{\varphi}=\boldsymbol{\Lambda}^{\mathrm v}\!\otimes\!\mathbf{k}^{2}$};
+\draw[ar]  (sm)  -- (r);
+\draw[arr] (su)  -- (phi);
+
+% ================================================ the two recurrences
+\node[shd] (eta) at (12.6,\yb) {\textbf{information}\\[-1pt]
+     {\scriptsize$\boldsymbol{\eta}_t=\alpha_t\boldsymbol{\eta}_{t-1}+\mathbf{r}_t$}\\[-3pt]
+     {\scriptsize\itshape affine in $\boldsymbol{\eta}$}};
+\node[unc] (lam) at (12.6,\yr) {\textbf{precision}\\[-1pt]
+     {\scriptsize$\boldsymbol{\lambda}_t=\dfrac{A\boldsymbol{\lambda}_{t-1}+B}
+                                            {C\boldsymbol{\lambda}_{t-1}+D}$}\\[-3pt]
+     {\scriptsize\itshape fractional-linear $\Rightarrow$ non-linear}};
+\draw[ar]  (r)   -- (eta);
+\draw[arr] (phi) -- (lam);
+
+% ==== THE coupling: the Kalman gain is a function of the model's own uncertainty
+\node[draw=red!80, thick, rounded corners=2pt, fill=white, font=\scriptsize,
+      text=red!80, align=center, inner sep=3pt] (gain) at (12.6,{(\yb+\yr)/2})
+     {$\alpha_t=\dfrac{a}{a^{2}+p\,\boldsymbol{\lambda}_{t-1}}$};
+\draw[arr, line width=1.3pt] (lam.north) -- (gain.south);
+\draw[arr, line width=1.3pt] (gain.north) -- (eta.south);
+\node[font=\scriptsize\itshape, text=red!80, anchor=west, align=left]
+      at (14.35,{(\yb+\yr)/2}) {the gain is driven by\\the model's own uncertainty};
+
+% ================================================ read-out
+\node[shd, font=\scriptsize] (y)  at (17.0,\yb)
+     {$\mathbf{y}=\sum_s\mathbf{q}\,\boldsymbol{\eta}/{\color{red!80}\boldsymbol{\lambda}}$};
+\node[unc, font=\scriptsize] (yv) at (17.0,\yr)
+     {$\mathbf{y}_{\mathrm{var}}=\sum_s\mathbf{q}^{2}/\boldsymbol{\lambda}$};
+\draw[ar]  (eta) -- (y);
+\draw[arr] (lam) -- (yv);
+
+% ================================================ gate + out_proj, BOTH streams
+\node[shd, font=\scriptsize] (gy)  at (19.3,\yb) {$\times\,g$};
+\node[unc, font=\scriptsize] (gyv) at (19.3,\yr) {$\times\,g^{2}$};
+\draw[ar]  (y)  -- (gy);
+\draw[arr] (yv) -- (gyv);
+\draw[ar, gray!70] (gt.south) -- ++(0,-0.55) -| (gyv.south);
+
+\node[shd, font=\scriptsize] (wy)  at (20.9,\yb) {$W$};
+\node[unc, font=\scriptsize] (wyv) at (20.9,\yr) {$W^{2}$};
+\draw[ar]  (gy)  -- (wy);
+\draw[arr] (gyv) -- (wyv);
+
+\node[io] (out)  at (22.4,\yb) {$\mathbf{out}$};
+\node[io, text=red!80] (outv) at (22.4,\yr) {$\mathbf{out}_{\mathrm{var}}$};
+\draw[ar]  (wy)  -- (out);
+\draw[arr] (wyv) -- (outv);
+
+% ================================================ lane labels + legend
+\node[font=\small\itshape, anchor=south] at (9.1,{\yb+0.62}) {mean};
+\node[font=\small\itshape, text=red!80, anchor=north] at (9.1,{\yr-0.62}) {uncertainty};
+\node[font=\scriptsize, anchor=west] at (0,{\yr-2.15})
+     {\textbf{Legend:}\; black = shared with gated linear attention / deterministic SSMs \quad
+      {\color{red!80}\textbf{red} = KLA-only (uncertainty)}};
+\end{tikzpicture}
+}
+
+\begin{document}
+\centering
+\resizebox{\linewidth}{!}{\tikzKLABlock}
+\end{document}

@@ -1,0 +1,42 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the paper below."
+title: "kla: Kalman Linear Attention"
+abstract: >-
+  A linear-attention layer that runs an exact parallel Kalman filter over the
+  sequence: each token is a noisy observation and the output is the filtered
+  posterior mean (optionally its variance). Trains as parallel associative
+  scans with O(L log L) training and O(1)-per-token recurrent decoding.
+type: software
+license: MIT
+repository-code: "https://github.com/vaisakh-shaj/kalman-linear-attention"
+version: 0.1.0
+authors:
+  - family-names: Shaj
+    given-names: Vaisakh
+  - family-names: Barker
+    given-names: Cameron
+  - family-names: Scannell
+    given-names: Aidan
+  - family-names: Szecsenyi
+    given-names: Andras
+preferred-citation:
+  type: article
+  title: >-
+    Kalman Linear Attention: Parallel Bayesian Filtering For Efficient Language
+    Modelling and State Tracking
+  year: 2026
+  journal: "arXiv preprint arXiv:2602.10743"
+  url: "https://arxiv.org/abs/2602.10743"
+  authors:
+    - family-names: Shaj
+      given-names: Vaisakh
+    - family-names: Barker
+      given-names: Cameron
+    - family-names: Scannell
+      given-names: Aidan
+    - family-names: Szecsenyi
+      given-names: Andras
+    - family-names: Crowley
+      given-names: Elliot J.
+    - family-names: Storkey
+      given-names: Amos
