@@ -214,10 +214,7 @@ one of the other ways the Möbius scan can be implemented.
 
 The CUDA kernels are compiled on first use and need `nvcc`; everything else needs
 nothing. Anything outside their supported subset raises a clear error rather than
-silently computing the wrong thing. Two ship - `backend="cuda"` is the exact one,
-`"cuda_v2_1"` adds a clamp that bounds the variance harder at the cost of
-exactness - documented in
-[src/kla/ops/cuda_backend.py](src/kla/ops/cuda_backend.py).
+silently computing the wrong thing. 
 
 ---
 
