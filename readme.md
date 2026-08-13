@@ -99,14 +99,11 @@ layer = KLALayer(512, KLAConfig(d_state=16, return_variance=True))
 y, y_var = layer(torch.randn(2, 1024, 512))  # y_var: per-token, per-channel
 ```
 
-`y_var` is the filter's posterior variance, shaped exactly like `y`: one
-uncertainty value per channel per token. It is not a head bolted on top and not
-an ensemble - it fell out of the same non-linear recurrence that produced `y`,
-so it costs nothing extra and moves with the model rather than around it.
+`y_var` is the ouput variance after query readout from the latent posterior of the filter.
 
 ---
 
-## The two knobs you actually tune
+## The two hyperparamters you usually tune in KLA
 
 ```python
 KLAConfig(d_state=16)      # and d_model, which you pass to the layer
@@ -135,18 +132,15 @@ day-to-day use:
 
 ## The variants
 
-Two architectures, one config each. Both produce identical output shapes, so
-they are interchangeable.
+Two block architectures (minor varaitions), one config each. Both produce identical output shapes, so they are interchangeable.
 
 | variant | what changes | how to build it |
 |---|---|---|
 | **plain** *(default)* | full-width value and observation noise | `KLALayer(d, KLAConfig())` |
 | **mamba block** | value comes straight from the conv (as in Mamba); observation noise goes through a low-rank bottleneck | `KLALayer(d, KLAConfig(value_rank="conv", var_rank="dt"))` |
 
-**Which one?** Both ship because both were used - the MAD synthetic experiments
-are **plain**, the pretraining runs are the **mamba block** - and either
-reproduces the results it belongs to. Quality is comparable, so this is not an
-accuracy trade-off: pick on parameter budget.
+**Which to one?** Both ship because both were used - the MAD synthetic experiments
+use the **plain** blcok, the fineweb pretraining runs are the **mamba block** - and either reproduces the results it belongs to. Quality is comparable, so this is not an accuracy trade-off: pick on parameter budget.
 
 That makes **mamba block** the one to reach for at scale, where the point is to
 match Mamba's parameter count and state size at equal width: at `d_model=512` it
