@@ -192,7 +192,7 @@ def test_forward_matches_reference(backend):
         PASS means agreement to {max(d_y, d_var):.1e} between two *different*
         algorithms, not two runs of one: the reference is a sequential python loop over
         kla_step, while {backend} is a parallel associative scan
-        ({'in log space' if backend == 'torch' else 'in linear space, trace-normalized'}).
+        ({"in log space" if backend == "torch" else "in linear space, normalized"}).
         Only the algebra is shared, so agreement at float32 noise level says the
         parallel form is genuinely equivalent rather than merely self-consistent.
         """,
@@ -272,33 +272,51 @@ def test_backward_matches_reference(backend):
         err = rel_err(got.grad, ref.grad)
         loose = name in prof.loose_grads
         budget = prof.loose_grad_tol if loose else prof.exact_grad_tol
-        rows.append((
-            f"d{name}", err,
-            f"{'loose' if loose else 'exact'}  budget {budget:<7g} "
-            f"using {100 * err / budget:6.2f}%",
-        ))
+        rows.append(
+            (
+                f"d{name}",
+                err,
+                f"{'loose' if loose else 'exact'}  budget {budget:<7g} "
+                f"using {100 * err / budget:6.2f}%",
+            )
+        )
         if err >= budget:
-            over.append(f"d{name} {err:.3e} >= {budget:g} ({'loose' if loose else 'exact'})")
+            over.append(
+                f"d{name} {err:.3e} >= {budget:g} ({'loose' if loose else 'exact'})"
+            )
 
-    worst_name, worst_err, _ = max(rows, key=lambda r: r[1] / (
-        prof.loose_grad_tol if r[0][1:] in prof.loose_grads else prof.exact_grad_tol
-    ))
+    worst_name, worst_err, _ = max(
+        rows,
+        key=lambda r: (
+            r[1]
+            / (
+                prof.loose_grad_tol
+                if r[0][1:] in prof.loose_grads
+                else prof.exact_grad_tol
+            )
+        ),
+    )
     worst_budget = (
-        prof.loose_grad_tol if worst_name[1:] in prof.loose_grads else prof.exact_grad_tol
+        prof.loose_grad_tol
+        if worst_name[1:] in prof.loose_grads
+        else prof.exact_grad_tol
     )
     report(
         f"{backend}: gradient deviation vs the sequential reference",
         rows,
         why=f"""
         Worst input is {worst_name} at {100 * worst_err / worst_budget:.2f}% of its
-        budget. {'All six gradients are exact adjoints, so anything above ~1e-6 would '
-        'mean a real bug.' if not prof.loose_grads else
-        f"The loose group ({', '.join(prof.loose_grads)}) flows through the "
-        'trace-normalized Moebius backward, which is NOT the exact adjoint of the '
-        'forward compose -- a few percent there is the documented contract, not a '
-        f"regression. The exact group ({', '.join(prof.exact_grads)}) rides the "
-        'information-vector and read-out paths, which are exact, so those must stay '
-        'tight.'} PASS means every input is inside the budget its own path earns; it
+        budget. {
+            "All six gradients are exact adjoints, so anything above ~1e-6 would "
+            "mean a real bug."
+            if not prof.loose_grads
+            else f"The loose group ({', '.join(prof.loose_grads)}) flows through the "
+            "trace-normalized Moebius backward, which is NOT the exact adjoint of the "
+            "forward compose -- a few percent there is the documented contract, not a "
+            f"regression. The exact group ({', '.join(prof.exact_grads)}) rides the "
+            "information-vector and read-out paths, which are exact, so those "
+            "must stay tight."
+        } PASS means every input is inside the budget its own path earns; it
         does not mean the gradients are correct to float32 -- read the percentages.
         """,
     )
@@ -348,7 +366,9 @@ def test_gradient_descent_reduces_loss(backend):
             a.clamp_(min=1e-3, max=0.999)
         losses.append(loss.item())
 
-    assert all(math.isfinite(x) for x in losses), f"{backend}: non-finite loss: {losses}"
+    assert all(math.isfinite(x) for x in losses), (
+        f"{backend}: non-finite loss: {losses}"
+    )
     assert losses[-1] < losses[0], f"{backend}: loss did not decrease: {losses}"
 
 
@@ -397,19 +417,25 @@ def test_near_zero_decay_stays_finite(backend):
     report(
         f"{backend}: near-zero decay (a = 1e-10, a² = 1e-20)",
         [
-            ("nonfinite y", float((~torch.isfinite(y)).sum()), "entries; 0 = floored correctly"),
+            (
+                "nonfinite y",
+                float((~torch.isfinite(y)).sum()),
+                "entries; 0 = floored correctly",
+            ),
             ("nonfinite y_var", float((~torch.isfinite(y_var)).sum()), "entries"),
         ],
         why="""
         The leaf A = (1+p.phi)/a^2 reaches ~1e20 here, and the scan composes two RAW
         leaves before the first trace-normalization, so A^2 ~ 1e40 overflows float32
         (max 3.4e38); the normalizer then computes inf/inf = NaN. Flooring a^2 at 1e-12
-        caps A at ~1e12, so A^2 ~ 1e24 stays finite. """ + (
+        caps A at ~1e12, so A^2 ~ 1e24 stays finite. """
+        + (
             "SKIPPED for v2_1, which divides unguarded by design."
-            if prof.clips_phi else
-            "PASS = 0 nonfinite entries, i.e. the floor is active. It costs nothing: a "
-            "decay of 1e-6 already annihilates the state in one step, so flooring "
-            "changes only whether the arithmetic survives, never what the model computes."
+            if prof.clips_phi
+            else "PASS = 0 nonfinite entries, i.e. the floor is active. It costs "
+            "nothing: a decay of 1e-6 already annihilates the state in one step, "
+            "so flooring changes only whether the arithmetic survives, never what "
+            "the model computes."
         ),
     )
 
@@ -446,9 +472,9 @@ def test_high_information_tokens_are_not_clipped(backend):
     err_y, err_var = rel_err(y, y_ref), rel_err(y_var, y_var_ref)
 
     rho = phi_max / 1e3
+    verdict = "clipping kernel — deviation REQUIRED" if prof.clips_phi else "must match"
     report(
-        f"{backend}: high-phi deviation "
-        f"({'clipping kernel — deviation REQUIRED' if prof.clips_phi else 'must match'})",
+        f"{backend}: high-phi deviation ({verdict})",
         [
             ("max phi", phi_max, f"ceiling 1e3, so up to {rho:.1f}x saturation"),
             ("rel|dy|", err_y, "posterior mean"),
@@ -459,16 +485,21 @@ def test_high_information_tokens_are_not_clipped(backend):
         lambda recursion but leaves r = (v.Lambda^v).k uncapped -- and mean = r/phi only
         equals v/k because Lambda^v cancels between them, so a saturated token has BOTH
         its mean and its variance inflated by rho = phi/1000, here up to {rho:.1f}x.
-        """ + (f"""
+        """
+        + (
+            f"""
         This backend PASSES BY DEVIATING ({max(err_y, err_var):.2e} > 5e-3): that
         confirms its clamp is still engaging. A pass in the other direction would mean
         v2_1 had silently stopped clipping -- which is why the assertion is inverted
         here rather than skipped.
-        """ if prof.clips_phi else f"""
+        """
+            if prof.clips_phi
+            else f"""
         This backend matches the reference to {max(err_y, err_var):.1e} at
         {rho:.1f}x past where v2_1 clips, so PASS means the ceiling is genuinely gone
         and the Lambda^v cancellation is intact.
-        """),
+        """
+        ),
     )
 
     # Clipping shows up as an O(ρ) deviation, far above float32 scan noise.
@@ -479,8 +510,12 @@ def test_high_information_tokens_are_not_clipped(backend):
             "passes, v2_1's phi ceiling is no longer engaging"
         )
     else:
-        assert err_y < 5e-3, f"{backend}: y deviates at phi_max={phi_max:g} ({err_y:.2e})"
-        assert err_var < 5e-3, f"{backend}: y_var deviates at phi_max={phi_max:g} ({err_var:.2e})"
+        assert err_y < 5e-3, (
+            f"{backend}: y deviates at phi_max={phi_max:g} ({err_y:.2e})"
+        )
+        assert err_var < 5e-3, (
+            f"{backend}: y_var deviates at phi_max={phi_max:g} ({err_var:.2e})"
+        )
 
 
 # ------------------------------------------------------- fused triton kernel
@@ -524,7 +559,9 @@ def test_fused_matches_composed(L):
     inputs = make_inputs("cuda", L=L)
     with torch.no_grad():
         y_fused, var_fused, s_fused = kla_scan(*inputs, backend="triton")
-    y_comp, var_comp, s_comp = kla_scan(*inputs, backend="triton")  # grad on -> composed
+    y_comp, var_comp, s_comp = kla_scan(
+        *inputs, backend="triton"
+    )  # grad on -> composed
 
     torch.testing.assert_close(y_fused, y_comp, atol=5e-4, rtol=5e-4)
     torch.testing.assert_close(var_fused, var_comp, atol=5e-4, rtol=5e-4)
@@ -557,11 +594,23 @@ def test_fused_carried_initial_state():
         y_full, _, _ = kla_scan(v, lambda_v, k, q, a, p, backend="triton")
         mid = 40  # inside the first chunk, so the split is not chunk-aligned
         y1, _, state = kla_scan(
-            v[:, :mid], lambda_v[:, :mid], k[:, :mid], q[:, :mid], a, p, backend="triton"
+            v[:, :mid],
+            lambda_v[:, :mid],
+            k[:, :mid],
+            q[:, :mid],
+            a,
+            p,
+            backend="triton",
         )
         y2, _, _ = kla_scan(
-            v[:, mid:], lambda_v[:, mid:], k[:, mid:], q[:, mid:], a, p,
-            backend="triton", initial_state=state,
+            v[:, mid:],
+            lambda_v[:, mid:],
+            k[:, mid:],
+            q[:, mid:],
+            a,
+            p,
+            backend="triton",
+            initial_state=state,
         )
     torch.testing.assert_close(torch.cat([y1, y2], 1), y_full, atol=5e-4, rtol=5e-4)
 

@@ -31,7 +31,9 @@ import math
 import torch
 
 
-def marginal_logprobs(head, mu, var, mc_samples: int, generator=None, owner: str = "model"):
+def marginal_logprobs(
+    head, mu, var, mc_samples: int, generator=None, owner: str = "model"
+):
     """``log (1/S) sum_s softmax(head(mu + eps_s * std))``, all S samples at once.
 
     ``head`` must return log-probabilities and broadcast over a leading sample
@@ -58,7 +60,7 @@ def marginal_logprobs(head, mu, var, mc_samples: int, generator=None, owner: str
     eps = torch.randn(
         (mc_samples, *mu.shape), device=mu.device, dtype=mu.dtype, generator=generator
     )
-    log_p = head(mu + eps * std)                       # [S, ..., vocab]
+    log_p = head(mu + eps * std)  # [S, ..., vocab]
     return torch.logsumexp(log_p, dim=0) - math.log(mc_samples)
 
 

@@ -42,9 +42,18 @@ def _tracenorm_combine(la, lb, lc, ld, ra, rb, rc, rd):
 
 @triton.jit
 def _tiled_mobius_fwd_kernel(
-    A_ptr, B_ptr, C_ptr, D_ptr, lam0_ptr, out_ptr,
-    M, L, S, N_CHUNKS,
-    BLOCK_L: tl.constexpr, BLOCK_S: tl.constexpr,
+    A_ptr,
+    B_ptr,
+    C_ptr,
+    D_ptr,
+    lam0_ptr,
+    out_ptr,
+    M,
+    L,
+    S,
+    N_CHUNKS,
+    BLOCK_L: tl.constexpr,
+    BLOCK_S: tl.constexpr,
 ):
     pid = tl.program_id(0)
     b = pid // M
@@ -125,9 +134,19 @@ def tiled_mobius_lambda(
     block_s = triton.next_power_of_2(S)
     num_warps = 2 if block_l <= 128 else 4
     _tiled_mobius_fwd_kernel[(Bd * Mc,)](
-        Ai, Bi, Ci, Di, lam0, out,
-        Mc, L, S, n_chunks,
-        BLOCK_L=block_l, BLOCK_S=block_s, num_warps=num_warps,
+        Ai,
+        Bi,
+        Ci,
+        Di,
+        lam0,
+        out,
+        Mc,
+        L,
+        S,
+        n_chunks,
+        BLOCK_L=block_l,
+        BLOCK_S=block_s,
+        num_warps=num_warps,
     )
     return out.permute(0, 2, 1, 3).contiguous()  # [B, L, M, S]
 
@@ -140,9 +159,15 @@ def _affine_combine(la, lb, ra, rb):
 
 @triton.jit
 def _tiled_linear_fwd_kernel(
-    alpha_ptr, r_ptr, out_ptr,
-    M, L, S, N_CHUNKS,
-    BLOCK_L: tl.constexpr, BLOCK_S: tl.constexpr,
+    alpha_ptr,
+    r_ptr,
+    out_ptr,
+    M,
+    L,
+    S,
+    N_CHUNKS,
+    BLOCK_L: tl.constexpr,
+    BLOCK_S: tl.constexpr,
 ):
     pid = tl.program_id(0)
     b = pid // M
@@ -154,7 +179,7 @@ def _tiled_linear_fwd_kernel(
     t = tl.arange(0, BLOCK_L)
 
     ca = tl.zeros([BLOCK_S], tl.float32) + 1.0  # running gain
-    cb = tl.zeros([BLOCK_S], tl.float32)        # running value (η)
+    cb = tl.zeros([BLOCK_S], tl.float32)  # running value (η)
 
     for c in range(N_CHUNKS):
         tt = c * BLOCK_L + t
@@ -179,7 +204,7 @@ def _tiled_linear_fwd_kernel(
 
 def tiled_linear_eta(
     alpha: torch.Tensor,  # [B, L, M, S] gain α_t
-    r: torch.Tensor,      # [B, L, M, S] input r_t (η0 already folded into t=0)
+    r: torch.Tensor,  # [B, L, M, S] input r_t (η0 already folded into t=0)
     block_l: int = 128,
 ) -> torch.Tensor:
     """Return η_t [B, L, M, S] via the tiled affine scan η_t = α_t·η_{t-1} + r_t."""
@@ -194,8 +219,16 @@ def tiled_linear_eta(
     block_s = triton.next_power_of_2(S)
     num_warps = 2 if block_l <= 128 else 4
     _tiled_linear_fwd_kernel[(Bd * Mc,)](
-        ai, ri, out, Mc, L, S, n_chunks,
-        BLOCK_L=block_l, BLOCK_S=block_s, num_warps=num_warps,
+        ai,
+        ri,
+        out,
+        Mc,
+        L,
+        S,
+        n_chunks,
+        BLOCK_L=block_l,
+        BLOCK_S=block_s,
+        num_warps=num_warps,
     )
     return out.permute(0, 2, 1, 3).contiguous()
 

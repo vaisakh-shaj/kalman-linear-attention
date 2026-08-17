@@ -9,48 +9,22 @@ Quick start::
     y = layer(torch.randn(2, 128, 512))          # [2, 128, 512]
 
 Every KLA variant is one config away - see :class:`KLAConfig` and the readme.
-Run ``python -m kla`` to print which scan backends are usable on this machine.
+Run ``python -m kla --check`` to test the scan backends on this machine.
 """
 
 from kla.configs import KLAConfig, ModelConfig
 from kla.layers import KLALayer, KLALayerState
 from kla.models import SequenceModel, build_mixer, register_mixer
-from kla.ops import KLAState, kla_scan, kla_scan_reference, kla_step
+from kla.ops import (
+    KLAState,
+    backend_names,
+    kla_scan,
+    kla_scan_reference,
+    kla_step,
+    resolve_backend,
+)
 
 __version__ = "0.1.0"
-
-
-def backend_info() -> dict:
-    """Which scan backends are usable here, and why not when they are not.
-
-    Never raises and never imports triton eagerly, so it is safe to call in a
-    notebook cell just to see what you have.
-    """
-    import torch
-
-    from kla.ops.kla_ops import _triton_available
-
-    cuda = torch.cuda.is_available()
-    triton_ok = bool(cuda and _triton_available())
-    return {
-        "device": torch.cuda.get_device_name(0) if cuda else "cpu",
-        "resolved_auto": "triton" if triton_ok else "torch",
-        "backends": {
-            "torch": (True, "always available; the reference implementation"),
-            "triton": (
-                triton_ok,
-                "ready" if triton_ok
-                else ("needs a CUDA device" if not cuda else "triton not importable"),
-            ),
-            "cuda": (
-                cuda,
-                "compiled on first use; needs a CUDA toolchain (nvcc)" if cuda
-                else "needs a CUDA device",
-            ),
-        },
-        "log_space_on": ["torch"],
-    }
-
 
 __all__ = [
     "KLAConfig",
@@ -59,11 +33,12 @@ __all__ = [
     "KLAState",
     "ModelConfig",
     "SequenceModel",
-    "backend_info",
+    "backend_names",
     "build_mixer",
-    "register_mixer",
     "kla_scan",
     "kla_scan_reference",
     "kla_step",
+    "register_mixer",
+    "resolve_backend",
     "__version__",
 ]

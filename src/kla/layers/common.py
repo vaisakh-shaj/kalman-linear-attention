@@ -17,7 +17,9 @@ def get_activation(name: str):
     try:
         return _ACTIVATIONS[name]
     except KeyError:
-        raise ValueError(f"Unknown activation {name!r}; expected one of {sorted(_ACTIVATIONS)}") from None
+        raise ValueError(
+            f"Unknown activation {name!r}; expected one of {sorted(_ACTIVATIONS)}"
+        ) from None
 
 
 def l2_norm(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
@@ -60,7 +62,9 @@ class CausalConv1d(nn.Module):
     ``kernel_size - 1`` pre-conv inputs, shaped [B, D, kernel_size - 1].
     """
 
-    def __init__(self, dim: int, kernel_size: int, activation: str = "silu", bias: bool = True):
+    def __init__(
+        self, dim: int, kernel_size: int, activation: str = "silu", bias: bool = True
+    ):
         super().__init__()
         self.dim = dim
         self.kernel_size = kernel_size
@@ -76,7 +80,9 @@ class CausalConv1d(nn.Module):
             nn.init.zeros_(self.bias)
 
     def init_state(self, batch: int, device=None, dtype=None) -> torch.Tensor:
-        return torch.zeros(batch, self.dim, self.kernel_size - 1, device=device, dtype=dtype)
+        return torch.zeros(
+            batch, self.dim, self.kernel_size - 1, device=device, dtype=dtype
+        )
 
     def forward(self, x: torch.Tensor, conv_state: torch.Tensor | None = None):
         """Returns (y [B, L, D], new_conv_state)."""
@@ -86,14 +92,16 @@ class CausalConv1d(nn.Module):
             conv_state = self.init_state(B, device=x.device, dtype=x_t.dtype)
         x_pad = torch.cat((conv_state.to(x_t.dtype), x_t), dim=-1)
         y = F.conv1d(x_pad, self.weight, self.bias, groups=self.dim)
-        new_state = x_pad[..., x_pad.shape[-1] - (self.kernel_size - 1):]
+        new_state = x_pad[..., x_pad.shape[-1] - (self.kernel_size - 1) :]
         return self.act(y).transpose(1, 2), new_state
 
 
 class MLP(nn.Module):
     """Channel mixer: SwiGLU or plain GELU MLP."""
 
-    def __init__(self, dim: int, ratio: float = 4.0, kind: str = "swiglu", bias: bool = False):
+    def __init__(
+        self, dim: int, ratio: float = 4.0, kind: str = "swiglu", bias: bool = False
+    ):
         super().__init__()
         hidden = int(dim * ratio)
         self.kind = kind

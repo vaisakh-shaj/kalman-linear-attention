@@ -3,12 +3,20 @@
 import pytest
 import torch
 
-from kla.ops import KLAState, init_state, kla_scan, kla_scan_reference, kla_scan_torch, kla_step
+from kla.ops import (
+    init_state,
+    kla_scan,
+    kla_scan_reference,
+    kla_scan_torch,
+    kla_step,
+)
 
 
 def make_inputs(device, B=2, L=64, M=16, S=8):
     v = torch.randn(B, L, M, device=device)
-    lambda_v = torch.rand(B, L, M, device=device) + 0.5  # value precision Λ^v (positive)
+    lambda_v = (
+        torch.rand(B, L, M, device=device) + 0.5
+    )  # value precision Λ^v (positive)
     k = torch.randn(B, L, S, device=device)
     q = torch.randn(B, L, S, device=device)
     a = torch.rand(M, S, device=device) * 0.5 + 0.4  # discrete decay, time-invariant
@@ -37,7 +45,13 @@ def test_step_matches_scan(device, decode_from_prior):
     ys, vs = [], []
     for t in range(v.shape[1]):
         y_t, v_t, state = kla_step(
-            v[:, t], lambda_v[:, t], k[:, t], q[:, t], a, p, state,
+            v[:, t],
+            lambda_v[:, t],
+            k[:, t],
+            q[:, t],
+            a,
+            p,
+            state,
             decode_from_prior=decode_from_prior,
         )
         ys.append(y_t)
@@ -51,7 +65,9 @@ def test_chunked_scan_with_state(device):
     v, lambda_v, k, q, a, p = make_inputs(device)
     y_full, v_full, _ = kla_scan_torch(v, lambda_v, k, q, a, p)
     mid = v.shape[1] // 2
-    y1, v1, s = kla_scan_torch(v[:, :mid], lambda_v[:, :mid], k[:, :mid], q[:, :mid], a, p)
+    y1, v1, s = kla_scan_torch(
+        v[:, :mid], lambda_v[:, :mid], k[:, :mid], q[:, :mid], a, p
+    )
     y2, v2, _ = kla_scan_torch(
         v[:, mid:], lambda_v[:, mid:], k[:, mid:], q[:, mid:], a, p, initial_state=s
     )
@@ -78,7 +94,9 @@ def test_dispatcher_backends(device):
         kla_scan(*inputs, backend="nope")
 
 
-needs_triton = pytest.mark.skipif(not torch.cuda.is_available(), reason="triton backend needs CUDA")
+needs_triton = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="triton backend needs CUDA"
+)
 
 
 @needs_triton
@@ -101,10 +119,18 @@ def test_triton_backend_chunked_state():
     v, lambda_v, k, q, a, p = make_inputs("cuda")
     y_full, _, _ = kla_scan(v, lambda_v, k, q, a, p, backend="triton")
     mid = v.shape[1] // 2
-    y1, _, s = kla_scan(v[:, :mid], lambda_v[:, :mid], k[:, :mid], q[:, :mid], a, p, backend="triton")
+    y1, _, s = kla_scan(
+        v[:, :mid], lambda_v[:, :mid], k[:, :mid], q[:, :mid], a, p, backend="triton"
+    )
     y2, _, _ = kla_scan(
-        v[:, mid:], lambda_v[:, mid:], k[:, mid:], q[:, mid:], a, p,
-        backend="triton", initial_state=s,
+        v[:, mid:],
+        lambda_v[:, mid:],
+        k[:, mid:],
+        q[:, mid:],
+        a,
+        p,
+        backend="triton",
+        initial_state=s,
     )
     torch.testing.assert_close(torch.cat([y1, y2], 1), y_full, atol=5e-4, rtol=5e-4)
 

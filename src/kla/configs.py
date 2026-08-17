@@ -61,7 +61,7 @@ class KLAConfig:
 
     # --- process / observation noise --------------------------------------
     process_noise_scale: float = 0.01
-    """Initial scale of the continuous process noise. 0.01 is the best empirical value."""
+    """Initial scale of the continuous process noise; 0.01 works best empirically."""
 
     learnable_process_noise: bool = True
     """If True the process noise is a trained parameter, otherwise a fixed buffer."""

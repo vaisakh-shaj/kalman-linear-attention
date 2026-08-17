@@ -96,8 +96,14 @@ def kla_scan_triton(
         # p is floored here to match _broadcast_ap on the composed path below —
         # the fused kernel has no internal guard against a non-positive p.
         y, y_var, lam_fin, eta_fin = fused_kla_forward(
-            v * lambda_v, lambda_v, k, q,
-            a.float(), p.float().clamp_min(P_MIN), lam0, eta0,
+            v * lambda_v,
+            lambda_v,
+            k,
+            q,
+            a.float(),
+            p.float().clamp_min(P_MIN),
+            lam0,
+            eta0,
         )
         return y, y_var, KLAState(lam=lam_fin, eta=eta_fin)
 

@@ -49,12 +49,24 @@ def _aff_combine(la, lb, ra, rb):
 
 @triton.jit
 def _fused_fwd_kernel(
-    msi_ptr, si_ptr, h_ptr, w_ptr,       # msi,si: [B,M,L]   h,w: [B,L,S]
-    a_ptr, q_ptr, lam0_ptr, eta0_ptr,    # a,q (decay, process noise): [M,S]   lam0,eta0: [B,M,S]
-    y_ptr, yvar_ptr,                     # [B,M,L]
-    lam_fin_ptr, eta_fin_ptr,            # [B,M,S] final filter state
-    M, L, S, N_CHUNKS,
-    BLOCK_L: tl.constexpr, BLOCK_S: tl.constexpr,
+    msi_ptr,  # v·Λ^v [B,M,L]
+    si_ptr,  # Λ^v [B,M,L]
+    h_ptr,  # k, the key [B,L,S]
+    w_ptr,  # q, the query [B,L,S]
+    a_ptr,  # decay a [M,S]
+    q_ptr,  # process noise p [M,S]
+    lam0_ptr,  # λ boundary [B,M,S]
+    eta0_ptr,  # η boundary [B,M,S]
+    y_ptr,  # out: y [B,M,L]
+    yvar_ptr,  # out: y_var [B,M,L]
+    lam_fin_ptr,  # out: final λ [B,M,S]
+    eta_fin_ptr,  # out: final η [B,M,S]
+    M,
+    L,
+    S,
+    N_CHUNKS,
+    BLOCK_L: tl.constexpr,
+    BLOCK_S: tl.constexpr,
 ):
     pid = tl.program_id(0)
     b = pid // M
@@ -65,7 +77,9 @@ def _fused_fwd_kernel(
     t = tl.arange(0, BLOCK_L)
 
     lam0 = tl.load(lam0_ptr + (b * M + m) * S + s, mask=s_mask, other=1.0)  # [S]
-    c_eta = tl.load(eta0_ptr + (b * M + m) * S + s, mask=s_mask, other=0.0)  # η boundary
+    c_eta = tl.load(
+        eta0_ptr + (b * M + m) * S + s, mask=s_mask, other=0.0
+    )  # η boundary
 
     # Static dynamics are loop-invariant, so hoist them out of the chunk loop.
     a_st = tl.load(a_ptr + m * S + s, mask=s_mask, other=1.0)
@@ -77,8 +91,8 @@ def _fused_fwd_kernel(
     cC = tl.zeros([BLOCK_S], tl.float32)
     cD = tl.zeros([BLOCK_S], tl.float32) + 1.0
 
-    base_ml = (b * M + m) * L     # μσ⁻¹[b,m,:], output[b,m,:]
-    base_hw = b * L * S           # h[b,:,:], w[b,:,:]
+    base_ml = (b * M + m) * L  # μσ⁻¹[b,m,:], output[b,m,:]
+    base_hw = b * L * S  # h[b,:,:], w[b,:,:]
 
     for c in range(N_CHUNKS):
         tt = c * BLOCK_L + t
@@ -104,7 +118,9 @@ def _fused_fwd_kernel(
         C = q_t / a2_t
         D = zero + 1.0
 
-        sA, sB, sC, sD = tl.associative_scan((A, phi, C, D), axis=0, combine_fn=_tn_combine)
+        sA, sB, sC, sD = tl.associative_scan(
+            (A, phi, C, D), axis=0, combine_fn=_tn_combine
+        )
         fA = sA * cA[None, :] + sB * cC[None, :]
         fB = sA * cB[None, :] + sB * cD[None, :]
         fC = sC * cA[None, :] + sD * cC[None, :]
@@ -141,7 +157,9 @@ def _fused_fwd_kernel(
     tl.store(eta_fin_ptr + (b * M + m) * S + s, c_eta, mask=s_mask)
 
 
-def fused_kla_forward(msi, si, h, w, a, q, lam0, eta0, block_l: int = 64, num_warps: int = 4):
+def fused_kla_forward(
+    msi, si, h, w, a, q, lam0, eta0, block_l: int = 64, num_warps: int = 4
+):
     """Fused forward. msi/si [B,L,M], h/w [B,L,S], lam0/eta0 [B,M,S].
 
     ``a``/``q`` (decay and process noise) are static ``[M, S]``. Returns
@@ -167,9 +185,25 @@ def fused_kla_forward(msi, si, h, w, a, q, lam0, eta0, block_l: int = 64, num_wa
     n_chunks = triton.cdiv(L, block_l)
     block_s = triton.next_power_of_2(S)
     _fused_fwd_kernel[(B * M,)](
-        msi_t, si_t, h_c, w_c, a_c, q_c, lam0_c, eta0_c, y, yvar, lam_fin, eta_fin,
-        M, L, S, n_chunks,
-        BLOCK_L=block_l, BLOCK_S=block_s, num_warps=num_warps,
+        msi_t,
+        si_t,
+        h_c,
+        w_c,
+        a_c,
+        q_c,
+        lam0_c,
+        eta0_c,
+        y,
+        yvar,
+        lam_fin,
+        eta_fin,
+        M,
+        L,
+        S,
+        n_chunks,
+        BLOCK_L=block_l,
+        BLOCK_S=block_s,
+        num_warps=num_warps,
     )
     return (
         y.permute(0, 2, 1).contiguous(),

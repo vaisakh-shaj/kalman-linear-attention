@@ -1,6 +1,5 @@
 """Flag-space and statefulness tests for the unified KLALayer."""
 
-
 import pytest
 import torch
 
@@ -33,7 +32,9 @@ def test_core_ablations_train_and_decode(device, discretization):
     y = layer(x)
     assert y.shape == x.shape and torch.isfinite(y).all()
     y.sum().backward()
-    assert all(p.grad is None or torch.isfinite(p.grad).all() for p in layer.parameters())
+    assert all(
+        p.grad is None or torch.isfinite(p.grad).all() for p in layer.parameters()
+    )
     assert _decode_parity(layer, x) < 1e-4
 
 

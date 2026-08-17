@@ -51,7 +51,9 @@ class KLAState(NamedTuple):
     eta: torch.Tensor  # [B, M, S] information vector η_t = Λ_t·mean_t
 
 
-def init_state(batch: int, d_model: int, d_state: int, device=None, dtype=torch.float32) -> KLAState:
+def init_state(
+    batch: int, d_model: int, d_state: int, device=None, dtype=torch.float32
+) -> KLAState:
     """Standard-normal prior: unit covariance (precision 1), zero mean."""
     return KLAState(
         lam=torch.ones(batch, d_model, d_state, device=device, dtype=dtype),
@@ -257,13 +259,17 @@ def kla_scan_torch(
         pA, pB, pC, pD = scan(_mobius_combine_log, (logA, logB, logC, logD), dim=1)
 
         log_lam0 = lam0.clamp_min(EPS).log().unsqueeze(1)
-        log_lam = torch.logaddexp(pA + log_lam0, pB) - torch.logaddexp(pC + log_lam0, pD)
+        log_lam = torch.logaddexp(pA + log_lam0, pB) - torch.logaddexp(
+            pC + log_lam0, pD
+        )
         lam = log_lam.exp()  # posterior precision [B, L, M, S]
         # exp(-log λ) rather than 1/λ: one fewer roundtrip through the exponent,
         # and it stays finite where λ itself would overflow.
         var = (-log_lam).exp()
     else:
-        raise ValueError(f"Unknown mobius_impl {mobius_impl!r}; expected 'linear' or 'log'")
+        raise ValueError(
+            f"Unknown mobius_impl {mobius_impl!r}; expected 'linear' or 'log'"
+        )
 
     # Information-vector affine scan; the gain α_t depends on λ_{t-1}.
     lam_prev = torch.cat((lam0.unsqueeze(1), lam[:, :-1]), dim=1)
@@ -301,7 +307,9 @@ def kla_step(
     v, lambda_v, k, q = _compute_dtype(v, lambda_v, k, q)
     dtype = v.dtype
 
-    phi = (lambda_v.unsqueeze(-1) * (k * k).unsqueeze(-2)).clamp_min(EPS)  # [B,M,1]·[B,1,S]
+    phi = (lambda_v.unsqueeze(-1) * (k * k).unsqueeze(-2)).clamp_min(
+        EPS
+    )  # [B,M,1]·[B,1,S]
     r = (v * lambda_v).unsqueeze(-1) * k.unsqueeze(-2)
 
     a_ = a.to(dtype).unsqueeze(0)  # [1, M, S], broadcasts over the batch
@@ -324,7 +332,12 @@ def kla_step(
 
 
 def kla_scan_reference(
-    v, lambda_v, k, q, a, p,
+    v,
+    lambda_v,
+    k,
+    q,
+    a,
+    p,
     initial_state: Optional[KLAState] = None,
     decode_from_prior: bool = False,
 ):
@@ -335,8 +348,14 @@ def kla_scan_reference(
     ys, yvars = [], []
     for t in range(L):
         y_t, yvar_t, state = kla_step(
-            v[:, t], lambda_v[:, t], k[:, t], q[:, t], a, p,
-            state, decode_from_prior=decode_from_prior,
+            v[:, t],
+            lambda_v[:, t],
+            k[:, t],
+            q[:, t],
+            a,
+            p,
+            state,
+            decode_from_prior=decode_from_prior,
         )
         ys.append(y_t)
         yvars.append(yvar_t)
@@ -419,16 +438,47 @@ def kla_scan(
     try:
         fn = _BACKENDS[backend]
     except KeyError:
-        raise ValueError(f"Unknown backend {backend!r}; expected one of {sorted(_BACKENDS)}") from None
+        raise ValueError(
+            f"Unknown backend {backend!r}; expected one of {sorted(_BACKENDS)}"
+        ) from None
     if backend == "torch":
         # scan_impl / mobius_impl are torch-only knobs: the GPU backends have one
         # scan shape and are already trace-normalized in linear space.
         return fn(
-            v, lambda_v, k, q, a, p,
-            initial_state=initial_state, scan_impl=scan_impl,
-            decode_from_prior=decode_from_prior, mobius_impl=mobius_impl,
+            v,
+            lambda_v,
+            k,
+            q,
+            a,
+            p,
+            initial_state=initial_state,
+            scan_impl=scan_impl,
+            decode_from_prior=decode_from_prior,
+            mobius_impl=mobius_impl,
         )
     return fn(
-        v, lambda_v, k, q, a, p,
-        initial_state=initial_state, decode_from_prior=decode_from_prior,
+        v,
+        lambda_v,
+        k,
+        q,
+        a,
+        p,
+        initial_state=initial_state,
+        decode_from_prior=decode_from_prior,
     )
+
+
+def backend_names() -> tuple:
+    """Every backend :func:`kla_scan` accepts, in dispatch order.
+
+    Read off the dispatch table itself, so it cannot drift from what
+    ``backend=`` will take.
+    """
+    return tuple(_BACKENDS)
+
+
+def resolve_backend(device=None) -> str:
+    """The backend ``backend="auto"`` resolves to for tensors on ``device``."""
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    return _resolve_auto(torch.empty(0, device=device))

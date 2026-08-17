@@ -14,18 +14,34 @@ authors = [
     { name = "Aidan Scannell", email = "aidan.scannell@ed.ac.uk" },
     { name = "Andras Szecsenyi", email = "andras.szecsenyi@gmail.com" },
 ]
-keywords = ["machine learning", "attention", "neural networks", "pytorch", "llm", "ssm"]
+keywords = [
+    "machine learning",
+    "attention",
+    "neural networks",
+    "pytorch",
+    "llm",
+    "ssm",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
     "Programming Language :: Python :: 3 :: Only",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-# Deliberately torch-only. The scan falls back to pure PyTorch, triton is
-# imported lazily (it ships with the Linux torch wheel), and the CUDA kernels
-# are compiled on first use only if you ask for backend="cuda". So there is no
-# build step and no CUDA toolchain needed to install or to run.
-dependencies = ["torch>=2.8"]
+dependencies = ["torch>=2.8", "numpy>=1.26", "tyro>=1.0.13"]
+
+# Opt-in backends
+[project.optional-dependencies]
+triton = ["triton>=3.6; sys_platform == 'linux'"]
+# Compiler for the CUDA backend's JIT build. cuda-toolkit is deliberately
+# unpinned: torch's own wheels already require an exact one (12.6.3 on a cu126
+# torch, 13.0.3 on a cu13 torch), so asking for the nvcc/cccl components without
+# a version follows whatever torch is installed. Pinning a major here instead
+# would downgrade torch to 2.10, the last release with no cuda-toolkit pin.
+cuda = [
+    "cuda-toolkit[cccl,nvcc]; sys_platform == 'linux'",
+    "ninja>=1.11; sys_platform == 'linux'",
+]
 
 [project.urls]
 Homepage = "https://github.com/vaisakh-shaj/kalman-linear-attention"
@@ -38,8 +54,36 @@ requires = ["uv_build>=0.11.16,<0.12"]
 build-backend = "uv_build"
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "ruff>=0.16", "pre-commit>=4"]
+cu126 = ["torch>=2.8; sys_platform == 'linux'"]
+cu130 = ["torch>=2.8; sys_platform == 'linux'"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["slow: finite-difference gradchecks; deselect with -m 'not slow'"]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.uv]
+default-groups = ["dev"]
+conflicts = [[{ group = "cu126" }, { group = "cu130" }]]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu126", group = "cu126", marker = "sys_platform == 'linux'" },
+    { index = "pytorch-cu130", group = "cu130", marker = "sys_platform == 'linux'" },
+]

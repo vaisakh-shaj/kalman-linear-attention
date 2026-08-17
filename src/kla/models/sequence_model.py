@@ -27,7 +27,7 @@ _MIXER_REGISTRY: dict[type, MixerBuilder] = {}
 
 
 def register_mixer(config_type: type, builder: MixerBuilder) -> None:
-    """Associate a config dataclass with a mixer constructor ``(d_model, cfg) -> nn.Module``."""
+    """Register a builder ``(d_model, cfg) -> nn.Module`` for a config dataclass."""
     _MIXER_REGISTRY[config_type] = builder
 
 
@@ -79,12 +79,16 @@ class Block(nn.Module):
     def forward(self, x: torch.Tensor, state=None, return_state: bool = False):
         emit_state = return_state or state is not None
         if emit_state:
-            mixed, new_state = self.mixer(self.mixer_norm(x), state=state, return_state=True)
+            mixed, new_state = self.mixer(
+                self.mixer_norm(x), state=state, return_state=True
+            )
             if isinstance(mixed, tuple):  # KLA with return_variance: use the mean path
                 mixed = mixed[0]
             x = x + mixed
         else:
-            x, _ = self.mix(x)  # variance discarded: cross-entropy has nowhere to put it
+            x, _ = self.mix(
+                x
+            )  # variance discarded: cross-entropy has nowhere to put it
             new_state = None
         x = self.channel(x)
         return (x, new_state) if emit_state else x
@@ -102,9 +106,15 @@ class SequenceModel(MarginalReadout, nn.Module):
         self.config = config
         if mixer is None:
             mixer = KLAConfig()
-        mixers = list(mixer) if isinstance(mixer, (list, tuple)) else [mixer] * config.n_layers
+        mixers = (
+            list(mixer)
+            if isinstance(mixer, (list, tuple))
+            else [mixer] * config.n_layers
+        )
         if len(mixers) != config.n_layers:
-            raise ValueError(f"Got {len(mixers)} mixer configs for {config.n_layers} layers")
+            raise ValueError(
+                f"Got {len(mixers)} mixer configs for {config.n_layers} layers"
+            )
 
         self.embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.blocks = nn.ModuleList(Block(config.d_model, m, config) for m in mixers)
@@ -119,7 +129,9 @@ class SequenceModel(MarginalReadout, nn.Module):
         if isinstance(module, nn.Linear):
             if not getattr(module.weight, "_no_reinit", False):
                 nn.init.normal_(module.weight, std=0.02)
-            if module.bias is not None and not getattr(module.bias, "_no_reinit", False):
+            if module.bias is not None and not getattr(
+                module.bias, "_no_reinit", False
+            ):
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, std=0.02)
@@ -131,7 +143,8 @@ class SequenceModel(MarginalReadout, nn.Module):
     def init_state(self, batch: int, device=None, dtype=None) -> list:
         device = device or self.device
         return [
-            blk.mixer.init_state(batch, device=device, dtype=dtype) for blk in self.blocks
+            blk.mixer.init_state(batch, device=device, dtype=dtype)
+            for blk in self.blocks
         ]
 
     def forward(
@@ -147,7 +160,9 @@ class SequenceModel(MarginalReadout, nn.Module):
         new_states = []
         for i, blk in enumerate(self.blocks):
             if emit_state:
-                x, s = blk(x, state=state[i] if state is not None else None, return_state=True)
+                x, s = blk(
+                    x, state=state[i] if state is not None else None, return_state=True
+                )
                 new_states.append(s)
             else:
                 x = blk(x)
@@ -205,7 +220,9 @@ class SequenceModel(MarginalReadout, nn.Module):
         return torch.cat(out, dim=1)
 
     @staticmethod
-    def _sample(logits: torch.Tensor, temperature: float, top_k: Optional[int]) -> torch.Tensor:
+    def _sample(
+        logits: torch.Tensor, temperature: float, top_k: Optional[int]
+    ) -> torch.Tensor:
         if temperature <= 0:
             return logits.argmax(dim=-1, keepdim=True)
         logits = logits / temperature

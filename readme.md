@@ -1,236 +1,86 @@
 # KLA - Kalman Linear Attention
 
-A sequence-mixing layer that is an **exact parallel Kalman filter**: it carries a
-belief rather than a point estimate, and updates it in closed form as the
-sequence arrives.
+A linear attention layer that is an **exact parallel Kalman filter**.
+Unlike other linear attention layers which model the current state as a single point in the state space,
+KLA models the current state as a **belief** over the state space, and updates it in closed form as the sequence arrives.
+KLA retains the parallel training and prefill advantages of linear state space models such as GLA and Mamba,
+while also providing a more expressive update (fractional linear / Möbius) that allows it to model uncertainty in the current state.
+KLA can be used as a drop in replacement for other linear attention layers, and can be used in any architecture that uses attention.
 
-| | Softmax attention | SSMs / GLA | **KLA** |
-|---|---|---|---|
-| Expressivity | nonlinear | linear | **fractional linear (Möbius)** |
-| Training | `O(T²)` | `O(T)` | `O(T)` |
-| Inference | `O(T)` | `O(1)` | `O(1)` |
-| Sequence uncertainty | ❌ | ❌ | ✅ |
-| Parallel training | ✅ | ✅ | ✅ |
+|                      | Softmax attention | SSMs / GLA | **KLA**                        |
+| -------------------- | ----------------- | ---------- | ------------------------------ |
+| Expressivity         | nonlinear         | linear     | **fractional linear (Möbius)** |
+| Training             | `O(T²)`           | `O(T)`     | `O(T)`                         |
+| Inference            | `O(T)`            | `O(1)`     | `O(1)`                         |
+| Sequence uncertainty | ❌                 | ❌          | ✅                              |
+| Parallel training    | ✅                 | ✅          | ✅                              |
 
-It keeps the efficiency of an SSM while the state update itself is **non-linear**
-- the posterior precision evolves through a Möbius (linear-fractional) map
-alongside the mean. Ordinary linear attention and SSMs carry a *linear*
-recurrence and emit a point estimate, so there is nothing to read an uncertainty
-off. Here the last row comes for free, because the filter has to compute it
-anyway.
+![The KLA block: two coupled streams](docs/figures/kla_block.png)
 
-Drop it in wherever you would put attention or a Mamba block.
-
-![The KLA block: two coupled streams](docs/kla_block.png)
-
-The outer shell (grey) is the scaffolding every gated linear attention /
-deterministic SSM block already has, so it is a drop-in replacement. Inside, the
-**blue stream is the one no other linear mixer has**. It is not a
-side-channel: the Kalman gain `alpha_t` is a function of the model's own current
-uncertainty, so the blue stream feeds back into the mean, and it is carried all
-the way to the output through the squared gate and squared output weights. That
-is what "uncertainty propagated through the recurrence" means, concretely.
+The blue stream is not a side-channel: the Kalman gain `alpha_t` is a function of
+the model's own uncertainty, so it feeds back into the mean.
 
 ## Install
 
+**PyPI:**
 ```bash
-git clone https://github.com/vaisakh-shaj/kalman-linear-attention.git
-cd kalman-linear-attention
-pip install -e .         # or:  uv pip install -e .
+uv pip install kla    # or: uv add kla
 ```
 
-That is the whole install. No build step, no CUDA toolchain, no `flash-attn`.
-The only dependency is `torch>=2.8`.
+**From source:**
+```bash
+git clone https://github.com/vaisakh-shaj/kalman-linear-attention.git kla
+uv pip install ./kla
+```
+
+Runs on CPU and NVIDIA GPUs out of the box. To see what this machine will use:
 
 ```bash
-python -m kla            # prints which scan backends this machine can use
+python -m kla --check-backends
 ```
 
-```
-kla 0.1.0   torch 2.12.0+cu130   device: cpu
-backend='auto' resolves to: torch
+Faster GPU kernels are optional extras — see [docs/backends.md](docs/backends.md):
 
-  [x] torch   always available; the reference implementation
-  [ ] triton  needs a CUDA device
-  [ ] cuda    needs a CUDA device
-
-  log-space scan on: torch
-
-  forward check: KLALayer(64) -> (2, 16, 64), 63,105 params   OK
+```bash
+uv pip install "kla[triton]"
 ```
 
----
+## Structure
 
-## 60 seconds
+This repository is split in two parts:
+- `src/kla`: The package containing the KLA layer and kernels.
+- (Coming Soon) `experiments/` + `main.py` (with `nanochat/` and `mad/` submodules): Non-package code to reproduce the papers experiments.
+
+The ancillary parts are:
+- `docs/`: General documentation — [usage](docs/usage.md), [backends](docs/backends.md).
+- `tests/`: Unit tests for the package.
+
+### Package
 
 ```python
 import torch
-from kla import KLAConfig, KLALayer
+from kla import KLAConfig, KLALayer, ModelConfig, SequenceModel
 
 layer = KLALayer(d_model=512, config=KLAConfig(d_state=16))
-y = layer(torch.randn(2, 1024, 512))        # -> [2, 1024, 512]
-```
+y = layer(torch.randn(2, 1024, 512))
 
-Same in/out shape as attention, so it slots into an existing block unchanged.
-It runs on CPU; on a CUDA device it switches to the fused triton kernel by
-itself.
-
-<table>
-<tr>
-<td width="30%"><img src="docs/kla_block_scaffold.png" alt="KLA inside a gated linear attention block"></td>
-<td>
-
-**Where it goes.** `KLALayer` is the <code>Kalman&nbsp;Filter</code> box. Everything
-around it - the projections, the causal conv, the SiLU gate - is the fused-MLP
-scaffolding common to gated linear attention and deterministic SSMs, and
-`KLALayer` already contains all of it. So the one line above is the whole block,
-not just the mixer.
-
-*(Figure 3a from the paper.)*
-
-</td>
-</tr>
-</table>
-
-**Want the uncertainty too?**
-
-```python
-layer = KLALayer(512, KLAConfig(d_state=16, return_variance=True))
-y, y_var = layer(torch.randn(2, 1024, 512))  # y_var: per-token, per-channel
-```
-
-`y_var` is the ouput variance after query readout from the latent posterior of the filter.
-
----
-
-## The two hyperparamters you usually tune in KLA
-
-```python
-KLAConfig(d_state=16)      # and d_model, which you pass to the layer
-```
-
-| knob | what it does | typical | tune it? |
-|---|---|---|---|
-| `d_model` | model width, passed to `KLALayer(d_model, ...)` | 128 - 4096 | **yes** |
-| `d_state` | filter state size per channel | **8 - 64** | **yes** |
-
-`d_state` is the one that is specific to KLA. It is how much the filter
-remembers: memory and compute scale linearly in it, and 16 is a good default.
-Below 8 the filter starts to degenerate; above 64 you rarely gain.
-
-Everything else has a sensible default and is there for research, not for
-day-to-day use:
-
-| | default | change it when |
-|---|---|---|
-| `expand` | `2.0` | you want a narrower/wider inner width (Mamba's convention) |
-| `value_rank`, `var_rank` | `"full"` | you want the **mamba block** - see below |
-| `backend` | `"auto"` | you are benchmarking, or debugging a kernel |
-| `qk_norm`, `use_conv`, `use_gating`, … | on | almost never |
-
----
-
-## The variants
-
-Two block architectures (minor varaitions), one config each. Both produce identical output shapes, so they are interchangeable.
-
-| variant | what changes | how to build it |
-|---|---|---|
-| **plain** *(default)* | full-width value and observation noise | `KLALayer(d, KLAConfig())` |
-| **mamba block** | value comes straight from the conv (as in Mamba); observation noise goes through a low-rank bottleneck | `KLALayer(d, KLAConfig(value_rank="conv", var_rank="dt"))` |
-
-**Which to one?** Both ship because both were used - the MAD synthetic experiments
-use the **plain** blcok, the fineweb pretraining runs are the **mamba block** - and either reproduces the results it belongs to. Quality is comparable, so this is not an accuracy trade-off: pick on parameter budget.
-
-That makes **mamba block** the one to reach for at scale, where the point is to
-match Mamba's parameter count and state size at equal width: at `d_model=512` it
-is 1.79M parameters against plain's 3.76M, and the gap grows with `d_model`.
-
-Neither changes the scan: both emit the same shapes, so every backend runs both.
-
-```python
-from kla import KLAConfig, KLALayer
-
-plain  = KLALayer(512, KLAConfig(d_state=16))
-mamba  = KLALayer(512, KLAConfig(d_state=16, value_rank="conv", var_rank="dt"))
-```
-
-`"dt"` resolves to `ceil(d_model/8)`, named after Mamba's `dt_rank` slot. You can
-also pass an integer for an explicit rank.
-
----
-
-## Streaming / autoregressive decode
-
-The filter is recurrent, so generation is **O(1) per token** with no KV cache.
-
-```python
-layer = KLALayer(512, KLAConfig(d_state=16))
+# stateful prefill + O(1) decode
 state = layer.init_state(batch=2)
+y, state = layer(torch.randn(2, 1024, 512), state=state)  # prefill
+y, state = layer(torch.randn(2, 1, 512), state=state)  # decode one token
 
-y, state = layer(prompt, state=state, return_state=True)   # prefill
-for _ in range(100):
-    y, state = layer(next_token, state=state, return_state=True)
-```
-
----
-
-## A whole language model
-
-```python
-import torch
-from kla import KLAConfig, ModelConfig, SequenceModel
-
+# a full language model
 model = SequenceModel(
-    ModelConfig(vocab_size=50257, d_model=512, n_layers=12),
-    KLAConfig(d_state=16),
+    ModelConfig(vocab_size=50304, d_model=512, n_layers=6), KLAConfig()
 )
-logits = model(torch.randint(0, 50257, (2, 1024)))     # [2, 1024, 50257]
-text   = model.generate(prompt_ids, max_new_tokens=64)
+logits = model(torch.randint(0, 50304, (2, 256)))
 ```
 
----
+Full API, config reference and the two published blocks: [docs/usage.md](docs/usage.md).
 
-## Backends
+### Experiments
 
-`backend="auto"` picks triton on a CUDA GPU and pure PyTorch otherwise. You
-should not need to touch this; the table is here so nothing surprises you.
-
-| | `torch` | `triton` | `cuda` |
-|---|---|---|---|
-| plain / mamba block | ✅ | ✅ | ✅ |
-| carried state (decode) | ✅ | ✅ | ❌ |
-| `d_state` | any | any | ≤ 64 |
-| float64 (`gradcheck`) | ✅ | - | - |
-
-`torch` is the portable reference and is not meant to be fast; the two GPU paths
-are fused and are what you want on a device. `auto` already picks between them.
-
-All three compose the precision (Möbius) recurrence the same simple way: a plain
-2×2 matmul renormalized by the trace at each step, which keeps the entries O(1)
-without ever leaving linear space and is stable as it stands. The torch backend
-also carries a log-space composition (`mobius_impl="log"`), kept for reference as
-one of the other ways the Möbius scan can be implemented.
-
-The CUDA kernels are compiled on first use and need `nvcc`; everything else needs
-nothing. Anything outside their supported subset raises a clear error rather than
-silently computing the wrong thing. 
-
----
-
-## What this package is not
-
-The installable package is deliberately just the layer. No training loop, no
-benchmark harness, no dataset glue - it is meant to be imported into whatever you
-already have.
-
-Reproduction code for the paper's experiments is coming to this repo: the **MAD**
-synthetic tasks ([mad-lab](https://github.com/athms/mad-lab)) behind the `plain`
-results, and **FineWeb-Edu** pretraining behind the `mamba` results.
-
-Not published to PyPI - install from source as above.
-
----
+*Coming Soon*
 
 ## Citation
 

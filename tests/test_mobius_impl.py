@@ -29,7 +29,9 @@ B, L, M, S = 2, 32, 8, 4
 IMPLS = ["linear", "log"]
 
 
-def _inputs(device="cpu", L=L, dtype=torch.float32, a_bar=None, requires_grad=False, seed=0):
+def _inputs(
+    device="cpu", L=L, dtype=torch.float32, a_bar=None, requires_grad=False, seed=0
+):
     """Scan inputs. ``a_bar`` pins the discrete decay to a constant if given."""
     g = torch.Generator(device=device).manual_seed(seed)
 
@@ -39,8 +41,11 @@ def _inputs(device="cpu", L=L, dtype=torch.float32, a_bar=None, requires_grad=Fa
     v, lambda_v = rnd(B, L, M), rnd(B, L, M).abs() + 0.5
     k, q = rnd(B, L, S), rnd(B, L, S)
     # ā = exp(Δa) lives in (0,1); p > 0. Mirror what the layer can actually emit.
-    a = torch.full((M, S), a_bar, device=device, dtype=dtype) if a_bar is not None \
+    a = (
+        torch.full((M, S), a_bar, device=device, dtype=dtype)
+        if a_bar is not None
         else rnd(M, S).abs().clamp(0.05, 0.95)
+    )
     p = rnd(M, S).abs() * 0.01 + 1e-4
     out = [v, lambda_v, k, q, a, p]
     if requires_grad:
@@ -132,7 +137,9 @@ def test_entries_stay_bounded():
     for _ in range(20):
         acc = _mobius_combine_tracenorm(acc, acc)
         A, Bm, Cm, D = acc
-        assert torch.stack(acc).isfinite().all(), "trace-norm produced non-finite entries"
+        assert torch.stack(acc).isfinite().all(), (
+            "trace-norm produced non-finite entries"
+        )
         assert (torch.stack(acc) >= 0).all(), "entries left the positive orthant"
         assert (A <= 1 + 1e-5).all() and (D <= 1 + 1e-5).all(), "diagonal escaped (0,1)"
         assert (Bm * Cm <= 0.25 + 1e-5).all(), "B*C exceeded the determinant bound"
@@ -173,9 +180,13 @@ def test_extreme_decay_boundary(a_bar):
     log = kla_scan_torch(*args, mobius_impl="log")
 
     assert torch.isfinite(lin[0]).all(), f"ā={a_bar:g}: linear produced non-finite y"
-    assert torch.isfinite(lin[1]).all(), f"ā={a_bar:g}: linear produced non-finite y_var"
-    print(f"  ā={a_bar:<8g} rel(y)={_rel(lin[0], log[0]):.3e}  "
-          f"rel(y_var)={_rel(lin[1], log[1]):.3e}")
+    assert torch.isfinite(lin[1]).all(), (
+        f"ā={a_bar:g}: linear produced non-finite y_var"
+    )
+    print(
+        f"  ā={a_bar:<8g} rel(y)={_rel(lin[0], log[0]):.3e}  "
+        f"rel(y_var)={_rel(lin[1], log[1]):.3e}"
+    )
 
 
 def test_unknown_impl_rejected():

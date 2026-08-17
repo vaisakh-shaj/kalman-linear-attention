@@ -89,6 +89,7 @@ toolkit (e.g. nix's ``cuda-toolkit`` 13.x) is enough.
 from __future__ import annotations
 
 import functools
+import glob
 import os
 from typing import Optional
 
@@ -96,7 +97,9 @@ import torch
 
 from kla.ops.kla_ops import P_MIN, KLAState
 
-_KERNELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "cuda")
+_KERNELS_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "kernels", "cuda"
+)
 
 KERNEL_VERSIONS = ("v2_2", "v2_1")
 DEFAULT_KERNEL_VERSION = "v2_2"
@@ -106,9 +109,11 @@ def _csrc_dir(version: str) -> str:
     """Source directory for one kernel version (see the module docstring)."""
     if version not in KERNEL_VERSIONS:
         raise ValueError(
-            f"Unknown CUDA kernel version {version!r}; expected one of {list(KERNEL_VERSIONS)}"
+            f"Unknown CUDA kernel version {version!r}; "
+            f"expected one of {list(KERNEL_VERSIONS)}"
         )
     return os.path.join(_KERNELS_DIR, version)
+
 
 _NVCC_FLAGS = [
     "-O3",
@@ -133,15 +138,15 @@ def _extra_include_paths(version: str) -> list[str]:
     """Include dirs the build needs beyond CUDA_HOME.
 
     torch's extension headers pull in cusparse/cublas/… ; the matching redist
-    headers ship with the torch wheel under ``site-packages/nvidia/cu13/include``
-    (the system CUDA toolkit — e.g. nix's — often omits them). CUDA 13 also moved
-    the cub/cccl headers under ``$CUDA_HOME/include/cccl``; add it when present.
+    headers ship with the torch wheel (the system CUDA toolkit — e.g. nix's —
+    often omits them) under ``site-packages/nvidia/*/include``. Whatever is there
+    belongs to the torch that is installed, so take all of it and do not inspect
+    versions. CUDA 13 also moved the cub/cccl headers under
+    ``$CUDA_HOME/include/cccl``; add it when present.
     """
     paths = [_csrc_dir(version)]
     site = os.path.dirname(os.path.dirname(torch.__file__))  # site-packages
-    nvidia_inc = os.path.join(site, "nvidia", "cu13", "include")
-    if os.path.isdir(nvidia_inc):
-        paths.append(nvidia_inc)
+    paths += sorted(glob.glob(os.path.join(site, "nvidia", "*", "include")))
     cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("KLA_CUDA_HOME")
     if cuda_home:
         cccl = os.path.join(cuda_home, "include", "cccl")
@@ -161,11 +166,15 @@ def _load_extension(version: str = DEFAULT_KERNEL_VERSION):
         os.environ["CUDA_HOME"] = os.environ["KLA_CUDA_HOME"]
 
     csrc = _csrc_dir(version)
-    sources = [
-        os.path.join(csrc, f)
-        for f in sorted(os.listdir(csrc))
-        if f.endswith((".cu", ".cpp"))
-    ] if os.path.isdir(csrc) else []
+    sources = (
+        [
+            os.path.join(csrc, f)
+            for f in sorted(os.listdir(csrc))
+            if f.endswith((".cu", ".cpp"))
+        ]
+        if os.path.isdir(csrc)
+        else []
+    )
     if not sources:
         raise NotImplementedError(
             f"No CUDA kernel sources found under {csrc} — "
@@ -258,7 +267,9 @@ def kla_scan_cuda(
     if decode_from_prior:
         raise _unsupported("does not support decode_from_prior")
     if initial_state is not None:
-        raise _unsupported("supports only the zero/unit initial state (no carried prefill state)")
+        raise _unsupported(
+            "supports only the zero/unit initial state (no carried prefill state)"
+        )
     S = k.shape[2]
     if S > MAX_DSTATE:
         raise _unsupported(f"supports d_state <= {MAX_DSTATE} (got {S})")

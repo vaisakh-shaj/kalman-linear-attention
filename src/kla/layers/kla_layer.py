@@ -30,7 +30,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from kla.configs import KLAConfig
-from kla.layers.common import CausalConv1d, get_activation, inv_softplus_dt_init, l2_norm
+from kla.layers.common import (
+    CausalConv1d,
+    get_activation,
+    inv_softplus_dt_init,
+    l2_norm,
+)
 from kla.ops import KLAState, init_state, kla_scan, kla_step
 
 
@@ -73,8 +78,10 @@ class KLALayer(nn.Module):
         self._var_rank = auto_rank if config.var_rank == "dt" else config.var_rank
 
         # Width this projection emits for each of the two wide signals.
-        self._w_value = 0 if self._value_rank == "conv" else (
-            M if self._value_rank == "full" else int(self._value_rank)
+        self._w_value = (
+            0
+            if self._value_rank == "conv"
+            else (M if self._value_rank == "full" else int(self._value_rank))
         )
         self._w_var = M if self._var_rank == "full" else int(self._var_rank)
 
@@ -84,11 +91,13 @@ class KLALayer(nn.Module):
         # Up-projections, present only for the low-rank settings.
         self.value_expand = (
             nn.Linear(int(self._value_rank), M, bias=config.bias)
-            if self._value_rank not in ("full", "conv") else None
+            if self._value_rank not in ("full", "conv")
+            else None
         )
         self.var_expand = (
             nn.Linear(int(self._var_rank), M, bias=config.bias)
-            if self._var_rank != "full" else None
+            if self._var_rank != "full"
+            else None
         )
 
         # Discretization step Δ: static learned parameter (paper: a, p time-invariant).
@@ -112,7 +121,9 @@ class KLALayer(nn.Module):
         else:
             self.lambda_skip = None
 
-        self.gate_act = get_activation(config.gating_activation) if config.use_gating else None
+        self.gate_act = (
+            get_activation(config.gating_activation) if config.use_gating else None
+        )
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=config.bias)
 
         self.reset_parameters()
@@ -130,20 +141,28 @@ class KLALayer(nn.Module):
             inv_softplus_dt_init((M, S), cfg.dt_min, cfg.dt_max, cfg.dt_init_floor)
         )
         self.lambda_log.zero_()
-        self.process_noise.fill_(0.0 if cfg.zero_process_noise else cfg.process_noise_scale)
+        self.process_noise.fill_(
+            0.0 if cfg.zero_process_noise else cfg.process_noise_scale
+        )
         if self.lambda_skip is not None:
             self.lambda_skip.fill_(cfg.lambda_skip_init)
 
     # ------------------------------------------------------------------ state
 
     def init_state(self, batch: int, device=None, dtype=None) -> KLALayerState:
-        conv = self.conv.init_state(batch, device=device, dtype=dtype) if self.conv else None
-        return KLALayerState(conv=conv, ssm=init_state(batch, self.d_inner, self.d_state, device=device))
+        conv = (
+            self.conv.init_state(batch, device=device, dtype=dtype)
+            if self.conv
+            else None
+        )
+        return KLALayerState(
+            conv=conv, ssm=init_state(batch, self.d_inner, self.d_state, device=device)
+        )
 
     # ------------------------------------------------------------- parameters
 
     def _continuous_params(self):
-        """Continuous-time (raw) dynamics: transition a and process noise p (paper notation)."""
+        """Continuous-time (raw) dynamics: transition a and process noise p."""
         a = -torch.exp(self.lambda_log.float())  # [M, S], strictly negative
         p = self.process_noise.float()
         if self.config.zero_process_noise:
@@ -155,7 +174,7 @@ class KLALayer(nn.Module):
         return a, p
 
     def _discretize(self, delta: torch.Tensor, a: torch.Tensor, p: torch.Tensor):
-        """Δ [..., M, S] (broadcastable) → discrete decay a_bar and process noise p_bar."""
+        """Δ [..., M, S] (broadcastable) → discrete a_bar and process noise p_bar."""
         a_bar = torch.exp(delta * a)
         if self.config.discretization == "ou":
             lam_pos = a.abs().clamp_min(1e-8)
@@ -181,7 +200,7 @@ class KLALayer(nn.Module):
         done inside the scan ops, so raw ``v`` is passed through here.
         """
         cfg = self.config
-        M, S = self.d_inner, self.d_state
+        S = self.d_state
 
         v, log_sigma_v, k, q = torch.split(
             self.sensor_proj(z), [self._w_value, self._w_var, S, S], dim=-1
@@ -189,7 +208,7 @@ class KLALayer(nn.Module):
         # v: taken straight from z ("conv"), lifted from a low-rank code, or
         # already full width. log σ²_v: lifted or already full width.
         if self._value_rank == "conv":
-            v = z                       # [B, L, M] -- the width _w_value is 0
+            v = z  # [B, L, M] -- the width _w_value is 0
         elif self.value_expand is not None:
             v = self.value_expand(v)
         if self.var_expand is not None:
@@ -202,7 +221,9 @@ class KLALayer(nn.Module):
             k = k.clamp(-cfg.clip_value, cfg.clip_value)
             q = q.clamp(-cfg.clip_value, cfg.clip_value)
 
-        sigma_v = F.softplus(log_sigma_v.float()) + cfg.obs_var_min  # observation-noise variance
+        sigma_v = (
+            F.softplus(log_sigma_v.float()) + cfg.obs_var_min
+        )  # observation-noise variance
         if cfg.obs_var_max is not None:
             sigma_v = sigma_v.clamp_max(cfg.obs_var_max)
 
@@ -213,7 +234,7 @@ class KLALayer(nn.Module):
 
     def _run_ssm(self, z: torch.Tensor, ssm_state: KLAState | None):
         cfg = self.config
-        # v = value, lambda_v = value precision Λ^v, k = key, q = readout (paper notation).
+        # v = value, lambda_v = precision Λ^v, k = key, q = readout (paper notation).
         v, lambda_v, k, q = self._project_sensors(z)
         a_bar, p_bar = self._compute_aq()  # discretized decay + process noise, [M, S]
 
@@ -222,7 +243,12 @@ class KLALayer(nn.Module):
             # unit prior (the only initial state the CUDA backend supports).
             state = None if lam0 is None else KLAState(lam=lam0, eta=eta0)
             return kla_scan(
-                v, lambda_v, k, q, a_bar, p_bar,
+                v,
+                lambda_v,
+                k,
+                q,
+                a_bar,
+                p_bar,
                 initial_state=state,
                 backend=cfg.backend,
                 scan_impl=cfg.scan_impl,
@@ -235,7 +261,13 @@ class KLALayer(nn.Module):
         with torch.autocast(device_type=z.device.type, enabled=False):
             if cfg.checkpoint_ssm and torch.is_grad_enabled() and self.training:
                 y, y_var, new_state = torch.utils.checkpoint.checkpoint(
-                    scan, v, lambda_v, k, q, lam0, eta0,
+                    scan,
+                    v,
+                    lambda_v,
+                    k,
+                    q,
+                    lam0,
+                    eta0,
                     use_reentrant=False,
                 )
             else:
@@ -249,8 +281,14 @@ class KLALayer(nn.Module):
         a_bar, p_bar = self._compute_aq()  # discretized decay + process noise, [M, S]
         with torch.autocast(device_type=z.device.type, enabled=False):
             y, y_var, new_state = kla_step(
-                v[:, 0], lambda_v[:, 0], k[:, 0], q[:, 0], a_bar, p_bar,
-                ssm_state, decode_from_prior=cfg.decode_from_prior,
+                v[:, 0],
+                lambda_v[:, 0],
+                k[:, 0],
+                q[:, 0],
+                a_bar,
+                p_bar,
+                ssm_state,
+                decode_from_prior=cfg.decode_from_prior,
             )
         return y.unsqueeze(1), y_var.unsqueeze(1), new_state
 

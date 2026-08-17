@@ -21,10 +21,14 @@ from typing import Callable, Sequence
 
 import torch
 
-CombineFn = Callable[[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]], tuple[torch.Tensor, ...]]
+CombineFn = Callable[
+    [tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]], tuple[torch.Tensor, ...]
+]
 
 
-def doubling_scan(combine_fn: CombineFn, xs: Sequence[torch.Tensor], dim: int) -> tuple[torch.Tensor, ...]:
+def doubling_scan(
+    combine_fn: CombineFn, xs: Sequence[torch.Tensor], dim: int
+) -> tuple[torch.Tensor, ...]:
     """Inclusive scan via Hillis–Steele doubling."""
     ys = tuple(xs)
     length = ys[0].size(dim)
@@ -41,7 +45,9 @@ def doubling_scan(combine_fn: CombineFn, xs: Sequence[torch.Tensor], dim: int) -
     return ys
 
 
-def sequential_scan(combine_fn: CombineFn, xs: Sequence[torch.Tensor], dim: int) -> tuple[torch.Tensor, ...]:
+def sequential_scan(
+    combine_fn: CombineFn, xs: Sequence[torch.Tensor], dim: int
+) -> tuple[torch.Tensor, ...]:
     """Inclusive scan via a python loop (reference implementation)."""
     length = xs[0].size(dim)
     state = tuple(t.select(dim, 0) for t in xs)
@@ -62,18 +68,24 @@ def _associative_scan_available() -> bool:
     return True
 
 
-def associative_scan(combine_fn: CombineFn, xs: Sequence[torch.Tensor], dim: int) -> tuple[torch.Tensor, ...]:
+def associative_scan(
+    combine_fn: CombineFn, xs: Sequence[torch.Tensor], dim: int
+) -> tuple[torch.Tensor, ...]:
     """Inclusive scan via torch's higher-order associative_scan op."""
     from torch._higher_order_ops import associative_scan as _scan
 
     def combine(left, right):
         return combine_fn(tuple(left), tuple(right))
 
-    out = _scan(combine, tuple(x.contiguous() for x in xs), dim=dim, combine_mode="generic")
+    out = _scan(
+        combine, tuple(x.contiguous() for x in xs), dim=dim, combine_mode="generic"
+    )
     return tuple(out)
 
 
-def resolve_scan(scan_impl: str) -> Callable[[CombineFn, Sequence[torch.Tensor], int], tuple[torch.Tensor, ...]]:
+def resolve_scan(
+    scan_impl: str,
+) -> Callable[[CombineFn, Sequence[torch.Tensor], int], tuple[torch.Tensor, ...]]:
     if scan_impl == "auto":
         scan_impl = "associative" if _associative_scan_available() else "doubling"
     if scan_impl == "associative":
