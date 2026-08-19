@@ -28,19 +28,12 @@ classifiers = [
     "Programming Language :: Python :: 3 :: Only",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = ["torch>=2.8", "numpy>=1.26", "tyro>=1.0.13"]
-
-# Opt-in backends
-[project.optional-dependencies]
-triton = ["triton>=3.6; sys_platform == 'linux'"]
-# Compiler for the CUDA backend's JIT build. cuda-toolkit is deliberately
-# unpinned: torch's own wheels already require an exact one (12.6.3 on a cu126
-# torch, 13.0.3 on a cu13 torch), so asking for the nvcc/cccl components without
-# a version follows whatever torch is installed. Pinning a major here instead
-# would downgrade torch to 2.10, the last release with no cuda-toolkit pin.
-cuda = [
-    "cuda-toolkit[cccl,nvcc]; sys_platform == 'linux'",
-    "ninja>=1.11; sys_platform == 'linux'",
+dependencies = [
+    "torch>=2.8",
+    "numpy>=1.26",
+    "tyro>=1.0.13",
+    "setuptools>=84.0.0",
+    "ninja>=1.11"
 ]
 
 [project.urls]

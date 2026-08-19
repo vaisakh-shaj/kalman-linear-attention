@@ -95,7 +95,7 @@ from typing import Optional
 
 import torch
 
-from kla.ops.kla_ops import P_MIN, KLAState
+from kla.ops.kla_ops import P_MIN, KLAState, init_state
 
 _KERNELS_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "kernels", "cuda"
@@ -291,3 +291,149 @@ def kla_scan_cuda(
     # both passes compile against the same kernel.
     y, y_var = _KLAMatmulScanFn.apply(msi, si, k3, q, a, p, kernel_version)
     return y, y_var, None
+
+
+# ------------------------------------------------------------ the exact scans
+#
+# The three scheme cells and the exact backward they share, under
+# kernels/cuda/scan/. Only the forward schedule differs between them; v2_1 and
+# v2_2 above stay as the approximate-backward comparison. Same algebra,
+# different adjoint -- see kla_scan_bwd.cuh for why differentiating the
+# recurrence is both exact and cheaper than differentiating the composition.
+
+_SCAN_DIR = os.path.join(_KERNELS_DIR, "scan")
+SCAN_MAX_DSTATE = 64
+"""Largest ``d_state`` the exact CUDA kernels take: one block must hold every
+state of a channel, because the read-out sums over the state axis."""
+
+
+@functools.cache
+def _load_scan_extension():
+    """JIT-compile and cache the exact-scan extension (first use only)."""
+    if os.environ.get("KLA_CUDA_HOME") and not os.environ.get("CUDA_HOME"):
+        os.environ["CUDA_HOME"] = os.environ["KLA_CUDA_HOME"]
+
+    sources = [
+        os.path.join(_SCAN_DIR, f)
+        for f in sorted(os.listdir(_SCAN_DIR))
+        if f.endswith((".cu", ".cpp"))
+    ]
+    if not sources:
+        raise NotImplementedError(
+            f"No CUDA scan sources found under {_SCAN_DIR} — "
+            "use backend='torch' or 'triton'."
+        )
+
+    from torch.utils.cpp_extension import load
+
+    site = os.path.dirname(os.path.dirname(torch.__file__))
+    includes = [_SCAN_DIR] + sorted(
+        glob.glob(os.path.join(site, "nvidia", "*", "include"))
+    )
+    return load(
+        name="kla_scan_cuda",
+        sources=sources,
+        extra_cuda_cflags=_NVCC_FLAGS,
+        extra_cflags=["-O3", "-std=c++17"],
+        extra_include_paths=includes,
+        verbose=os.environ.get("KLA_JIT_VERBOSE", "0") == "1",
+    )
+
+
+class _CudaKLAScan(torch.autograd.Function):
+    """One forward schedule, and the backward every schedule shares."""
+
+    @staticmethod
+    def forward(ctx, msi, si, k, q, a, p, lam0, eta0, prior, schedule):
+        ext = _load_scan_extension()
+        fwd = getattr(ext, f"{schedule}_fwd")
+        args = (msi, si, k, q, a, p, lam0, eta0)
+        if schedule == "pscan":
+            # The checkpoints are that schedule's own scan intermediates, so
+            # there is nothing for a flag to skip and it does not take one.
+            out = fwd(*args, prior)
+        else:
+            out = fwd(*args, any(ctx.needs_input_grad), prior)
+        y, yvar, lam_fin, eta_fin, lam_ck, eta_ck = out
+        ctx.prior = prior
+        ctx.save_for_backward(msi, si, k, q, a, p, lam0, eta0, lam_ck, eta_ck)
+        return y, yvar, lam_fin, eta_fin
+
+    @staticmethod
+    def backward(ctx, dy, dyvar, dlam_fin, deta_fin):
+        ext = _load_scan_extension()
+        msi, si, k, q, a, p, lam0, eta0, lam_ck, eta_ck = ctx.saved_tensors
+        grads = ext.bwd(
+            dy.contiguous(),
+            dyvar.contiguous(),
+            dlam_fin.contiguous(),
+            deta_fin.contiguous(),
+            msi,
+            si,
+            k,
+            q,
+            a,
+            p,
+            lam0,
+            eta0,
+            lam_ck,
+            eta_ck,
+            ctx.prior,
+        )
+        return (*grads, None, None)
+
+
+def _cuda_scan(schedule: str):
+    """Build one exact CUDA cell. Only the forward schedule differs."""
+
+    def run(
+        v: torch.Tensor,
+        lambda_v: torch.Tensor,
+        k: torch.Tensor,
+        q: torch.Tensor,
+        a: torch.Tensor,
+        p: torch.Tensor,
+        initial_state: Optional[KLAState] = None,
+        decode_from_prior: bool = False,
+    ):
+        if not v.is_cuda:
+            raise _unsupported("requires CUDA tensors")
+        if a.dim() != 2:
+            raise _unsupported("expects a/p of shape [M, S]")
+        S = k.shape[2]
+        if S > SCAN_MAX_DSTATE:
+            raise _unsupported(f"supports d_state <= {SCAN_MAX_DSTATE} (got {S})")
+
+        B, _, M = v.shape
+        state = initial_state
+        if state is None:
+            state = init_state(B, M, S, device=v.device)
+
+        # The kernel consumes the folded information mean v·Λ^v, so fold it in
+        # torch and let autograd split d(v·Λ^v) back into dv and d(Λ^v).
+        # Flooring p here rather than in the kernel does the same for the
+        # floor's subgradient.
+        y, y_var, lam_fin, eta_fin = _CudaKLAScan.apply(
+            (v.float() * lambda_v.float()).contiguous(),
+            lambda_v.float().contiguous(),
+            k.float().contiguous(),
+            q.float().contiguous(),
+            a.float().contiguous(),
+            p.float().clamp_min(P_MIN).contiguous(),
+            state.lam.float().contiguous(),
+            state.eta.float().contiguous(),
+            decode_from_prior,
+            schedule,
+        )
+        return y, y_var, KLAState(lam=lam_fin, eta=eta_fin)
+
+    run.__name__ = f"kla_scan_cuda_{schedule}"
+    run.__doc__ = (
+        f"``cuda_{schedule}``. Same contract as :func:`kla.ops.kla_scan_torch`."
+    )
+    return run
+
+
+kla_scan_cuda_recurrent = _cuda_scan("recurrent")
+kla_scan_cuda_chunk = _cuda_scan("chunk")
+kla_scan_cuda_pscan = _cuda_scan("pscan")

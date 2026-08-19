@@ -16,21 +16,24 @@ Naming backends asserts they work: ``--test-backends triton`` exits non-zero if
 triton is unusable here, so it is a CI smoke test. ``all`` is a survey and
 always exits 0 - on a CPU-only box the GPU ones are expected to fail.
 
-``--test-backends`` takes either a family (``mps``, which runs every Metal
-implementation) or one exact backend (``mps_fused``), so a single implementation
-can be pinned and checked on its own.
+``--test-backends`` takes either a backend (``mps``, which runs every Metal
+implementation) or one exact name (``mps_recurrent``), so a single
+implementation can be pinned and checked on its own. See
+``docs/implementations.md`` for the naming scheme.
 """
 
 from __future__ import annotations
 
+import textwrap
+
 import tyro
 
-# Prose keyed by backend family (see _families). A family added to the
-# dispatcher still lists; it just gets no description.
+# Prose keyed by backend. A backend added to the registry still lists; it just
+# gets no description.
 _DESCRIPTIONS = {
-    "torch": "the portable reference implementation",
-    "triton": "fused triton kernels",
-    "cuda": "JIT-compiled CUDA kernel; forward/training only",
+    "torch": "portable reference; the only float64 path",
+    "triton": "triton kernels; needs the triton package",
+    "cuda": "JIT-compiled CUDA kernels; needs nvcc",
     "mps": "Metal kernels; no toolchain needed",
 }
 
@@ -42,17 +45,19 @@ _MODULES = {
 }
 
 
-def _families(names: tuple[str, ...]) -> dict[str, list[str]]:
-    """Backend families, mapped to the implementations behind each.
+def _by_backend() -> dict[str, list[str]]:
+    """Backend -> the implementations behind it, read off the registry.
 
-    A family is everything sharing a ``<family>_<impl>`` prefix, because what a
-    reader wants from ``--check-backends`` is "can this machine run Metal / CUDA
-    kernels", which is one answer per device. ``--test-backends`` still accepts
-    the exact names (see :func:`main`).
+    Grouped on ``Impl.backend`` rather than on a name prefix: what a reader
+    wants from ``--check-backends`` is "can this machine run Metal / CUDA
+    kernels", which is one answer per device, and a name like
+    ``torch_unfused_chunk`` does not split on its first underscore.
     """
+    from kla.ops.kla_ops import implementations
+
     grouped: dict[str, list[str]] = {}
-    for name in names:
-        grouped.setdefault(name.split("_", 1)[0], []).append(name)
+    for name, impl in implementations().items():
+        grouped.setdefault(impl.backend, []).append(name)
     return grouped
 
 
@@ -61,13 +66,22 @@ def _families(names: tuple[str, ...]) -> dict[str, list[str]]:
 # restated here; keep them in step).
 _ATOL = _RTOL = 5e-4
 _GRAD_TOL = 1e-2
-# The CUDA backward is a knowingly approximate adjoint on the precision-scan
-# path, so d(lambda_v), d(k), d(a) and d(p) are held to a documented looser
-# budget - see the parity notes in kla.ops.cuda_backend. Tightening these would
-# fail a *correct* build.
-# Keyed by the group prefix, so every cuda kernel version gets the same budget.
-_LOOSE_GRADS = {"cuda": ("lambda_v", "k", "a", "p")}
+# An implementation declaring exact_bwd=False differentiates the Moebius
+# *composition* rather than the recurrence, which is ill-conditioned in float32
+# on the precision-scan path. Its d(lambda_v), d(k), d(a) and d(p) are held to a
+# documented looser budget; tightening them would fail a *correct* build. Only
+# the two prior CUDA kernels declare it - see docs/implementations.md.
+_LOOSE_GRADS = ("lambda_v", "k", "a", "p")
 _LOOSE_GRAD_TOL = 0.25
+
+
+def _loose_for(name: str) -> tuple[str, ...]:
+    """The inputs ``name`` is allowed an approximate gradient on."""
+    from kla.ops.kla_ops import implementations
+
+    impl = implementations().get(name)
+    return () if impl is None or impl.exact_bwd else _LOOSE_GRADS
+
 
 _INPUT_NAMES = ("v", "lambda_v", "k", "q", "a", "p")
 
@@ -244,7 +258,7 @@ def _gradients(backend: str, device: str) -> tuple[str, str]:
     y_ref, y_var_ref, _ = kla_scan_reference(*refs)
     (y_ref.square().sum() + y_var_ref.sum()).backward()
 
-    loose = next((v for k, v in _LOOSE_GRADS.items() if backend.startswith(k)), ())
+    loose = _loose_for(backend)
     worst_name, worst_ratio, worst_err = "", 0.0, 0.0
     for name, got, ref in zip(_INPUT_NAMES, args, refs):
         if got.grad is None:
@@ -295,37 +309,67 @@ def main(
         check_backends: Show every backend and whether it is usable here,
             without running it.
         test_backends: Run the named backends against the reference. Takes a
-            family ('mps'), an exact backend ('mps_fused'), or 'all'.
+            backend ('mps'), an exact implementation ('mps_recurrent'), or 'all'.
     """
     import torch
 
     import kla
     from kla.ops import default_device
 
-    families = _families(kla.backend_names())
-    width = max(len(name) for name in families)
+    grouped = _by_backend()
+    width = max(len(name) for name in grouped)
 
     if check_backends:
+        from kla.ops.kla_ops import backend_aliases, implementations
+
+        registry = implementations()
+        aliases = backend_aliases()
         requirements = _requirements()
         auto = kla.resolve_backend()
-        for name in families:
+        cell_width = max(len(n) for n in registry)
+        for name, cells in grouped.items():
             ok, why = _probe(name, requirements[name])
-            mark = "X" if name == auto else "x" if ok else " "
+            mark = "X" if aliases.get(name) == auto else "x" if ok else " "
             print(f"  [{mark}] {name:<{width}}  {why}")
+            if not ok:
+                # Nothing was probed, so capability columns would be a guess.
+                for line in textwrap.wrap(", ".join(cells), 70):
+                    print(f"        {line}")
+                continue
+            for cell in cells:
+                impl = registry[cell]
+                cap = (
+                    "d_state:any"
+                    if impl.max_d_state is None
+                    else f"d_state<={impl.max_d_state}"
+                )
+                note = "" if impl.exact_bwd else "   approximate backward"
+                default = "  <- default" if aliases.get(name) == cell else ""
+                fused = "fused  " if impl.fused else "unfused"
+                print(
+                    f"        {cell:<{cell_width}}  {fused}  "
+                    f"{impl.schedule:<9}  {cap}{note}{default}"
+                )
         print("\n  [X] = what backend='auto' resolves to here")
+        print(
+            "  Every implementation has a forward, an exact backward, state "
+            "carry,\n  prior decode and an fp32 scan, unless its row says "
+            "otherwise."
+        )
         return 0
 
     if test_backends is not None:
-        # A family runs every implementation behind it; an exact name runs just
-        # that one, so a single kernel can be pinned and asserted. Family names
-        # last: a family is also a dispatcher name, and naming it means the set.
-        targets = {name: [name] for name in kla.backend_names()} | dict(families)
+        # A backend name runs every implementation behind it; an exact name runs
+        # just that one, so a single kernel can be pinned and asserted. Backend
+        # names last: a backend name is also dispatchable, and naming it here
+        # means the set.
+        targets = {name: [name] for name in kla.backend_names()} | dict(grouped)
         if not test_backends:
             raise SystemExit(
                 f"--test-backends needs 'all', or one of {', '.join(targets)}"
             )
         survey = "all" in test_backends
-        selected = list(families) if survey else list(test_backends)
+        selected = list(grouped) if survey else list(test_backends)
         unknown = [name for name in selected if name not in targets]
         if unknown:
             raise SystemExit(

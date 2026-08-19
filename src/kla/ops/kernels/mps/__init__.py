@@ -1,19 +1,25 @@
 """Metal (MPS) kernels for the KLA scan.
 
-Three implementations of the same scan:
+Three forwards, one per schedule, and one backward they share (see
+``docs/implementations.md`` for what the schedules mean):
 
-``fused_kla_scan``
-    The default. Everything in one kernel with no ``[B, L, M, S]`` intermediate,
-    plus a hand-written fused backward that is the exact adjoint.
+``recurrent_kla_scan``
+    ``mps_recurrent``. One thread per ``(b, m, s)``, time serial, the Möbius map
+    applied rather than composed. No ``[B, L, M, S]`` intermediate.
 
-``tiled_kla_scan``
-    Forward only, with time as a parallel axis, for the batch-1 prefill shapes
-    the other two leave the GPU short of threads on.
+``chunk_kla_scan``
+    ``mps_chunk``. Time as a parallel axis, for the batch-1 prefill shapes the
+    other one leaves the GPU short of threads on.
 
-``lane_mobius_scan``
-    Standalone Möbius and affine scan primitives over ``[B, L, M, S]``
-    coefficients, with torch elementwise work around them — the shape the triton
-    backend has. No ``d_state`` ceiling.
+``pscan_kla_scan``
+    ``mps_pscan``. Reduce-then-scan: chunks reduced independently and resolved
+    by a parallel scan, so nothing waits on its neighbour. Depth ``log(NCK)``
+    instead of ``NCK``, paid for in ``[B, M, NCK, S]`` of aggregates.
+
+``kla_scan_bwd``
+    The exact adjoint, shared. All three forwards write the same
+    ``[B, M, NCK, S]`` checkpoints, and the reverse walk is over the serial
+    state lanes whichever forward produced them.
 
 The ``.metal`` sources sit alongside; :mod:`._shaders` compiles them through
 :func:`torch.mps.compile_shader`, so there is no build step and no toolchain to

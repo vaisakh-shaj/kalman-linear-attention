@@ -7,7 +7,7 @@
  *
  *   KLA_BLOCK_S   lanes per channel row = next_pow2(d_state)
  *   KLA_ROWS      channel rows per threadgroup
- *   KLA_CHUNK     timesteps recomputed per checkpoint in the fused backward
+ *   KLA_CHUNK     timesteps recomputed per checkpoint in the backward
  *
  * The thread mapping is the same everywhere: one thread owns one
  * ``(batch b, channel m, state s)`` triple and walks the sequence serially,
@@ -16,7 +16,7 @@
  * every state of one channel — which is what makes the read-out sum over ``s``
  * a lane reduction rather than a second kernel.
  *
- * Two reductions follow from that layout, and both are used by the fused
+ * Two reductions follow from that layout, and both are used by the
  * kernels only (the composed scans are pure elementwise-in-(b,m,s)):
  *
  *   kla_sum_over_states    along x — the read-out y = sum_s q.mean, and the
@@ -126,7 +126,7 @@ inline float2 kla_sum_over_channels(float2 v,
 
 // ------------------------------------------------------------- filter algebra
 //
-// One step of the precision recurrence, shared by the fused forward and the
+// One step of the precision recurrence, shared by the recurrent forward and the
 // fused backward's recompute so the two cannot drift.
 //
 //   predict  lambda^- = lambda' / (a^2 + p.lambda')

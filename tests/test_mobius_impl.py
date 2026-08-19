@@ -58,7 +58,9 @@ def _rel(x, y):
     return ((x - y).abs().max() / y.abs().max().clamp_min(1e-12)).item()
 
 
-@pytest.mark.parametrize("scan_impl", ["associative", "doubling", "sequential"])
+@pytest.mark.parametrize(
+    "scan_impl", ["associative", "doubling", "chunk", "sequential"]
+)
 def test_linear_matches_log_forward(scan_impl):
     """Same map, two representations -- across every way of parallelizing the scan.
 

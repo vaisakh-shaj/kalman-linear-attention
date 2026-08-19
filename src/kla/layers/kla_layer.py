@@ -251,7 +251,6 @@ class KLALayer(nn.Module):
                 p_bar,
                 initial_state=state,
                 backend=cfg.backend,
-                scan_impl=cfg.scan_impl,
                 mobius_impl=cfg.mobius_impl,
                 decode_from_prior=cfg.decode_from_prior,
             )

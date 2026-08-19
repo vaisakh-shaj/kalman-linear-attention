@@ -1,11 +1,13 @@
-"""Single fused KLA scan on Metal: sufficient statistics, both recurrences and
-the read-out in one kernel each way, so no ``[B, L, M, S]`` intermediate is ever
-written. The backward is the exact adjoint and the filter state is
-differentiable in both directions.
+"""``mps_recurrent`` — the whole scan in one kernel, time serial.
+
+Sufficient statistics, both recurrences and the read-out in one kernel, so no
+``[B, L, M, S]`` intermediate is ever written. The Möbius map is *applied* to a
+running λ rather than composed, which is what leaves the adjoint elementary; the
+backward is :mod:`kla.ops.kernels.mps.kla_scan_bwd`, shared with ``mps_chunk``.
 
 ``d_state`` is capped at :data:`~kla.ops.kernels.mps._shaders.MAX_DSTATE`. The
-replay scheme, reduction layout and atomics are described in the header of
-``fused_kla_scan.metal``.
+replay scheme, reduction layout and atomics are described in the headers of
+``recurrent_kla_scan.metal`` and ``kla_scan_bwd.metal``.
 """
 
 from __future__ import annotations
@@ -15,9 +17,10 @@ import torch
 from kla.ops.kernels.mps._shaders import (
     DEFAULT_CHUNK,
     check_inputs,
-    fused_library,
     launch_geometry,
+    recurrent_library,
 )
+from kla.ops.kernels.mps.kla_scan_bwd import scan_backward
 
 
 def _grid(B: int, M: int, S: int):
@@ -32,7 +35,7 @@ def _grid(B: int, M: int, S: int):
     return (block_s, m_padded, B), (block_s, rows, 1)
 
 
-def fused_forward(
+def recurrent_forward(
     msi: torch.Tensor,  # v·Λ^v  [B, L, M]
     si: torch.Tensor,  # Λ^v    [B, L, M]
     k: torch.Tensor,  # key    [B, L, S]
@@ -45,7 +48,7 @@ def fused_forward(
     prior: bool = False,
     chunk: int = DEFAULT_CHUNK,
 ):
-    """Fused forward. Returns ``(y, y_var, lam_fin, eta_fin, lam_ck, eta_ck)``.
+    """Recurrent forward. Returns ``(y, y_var, lam_fin, eta_fin, lam_ck, eta_ck)``.
 
     ``y`` / ``y_var`` are ``[B, L, M]``; the state tensors are ``[B, M, S]``.
     With ``checkpoints=False`` the two checkpoint tensors are one-element
@@ -55,7 +58,7 @@ def fused_forward(
     check_inputs(msi, si, k, q, a, p, lam0, eta0)
     B, L, M = msi.shape
     S = k.shape[2]
-    lib = fused_library(S, chunk)
+    lib = recurrent_library(S, chunk)
 
     dev = msi.device
     y = torch.empty(B, L, M, device=dev, dtype=torch.float32)
@@ -69,7 +72,7 @@ def fused_forward(
     eta_ck = torch.empty(*ck_shape, device=dev, dtype=torch.float32)
 
     threads, group = _grid(B, M, S)
-    lib.kla_fused_fwd(
+    lib.kla_recurrent_fwd(
         y,
         yvar,
         lam_fin,
@@ -96,82 +99,13 @@ def fused_forward(
     return y, yvar, lam_fin, eta_fin, lam_ck, eta_ck
 
 
-def fused_backward(
-    dy,
-    dyvar,
-    dlam_fin,
-    deta_fin,
-    msi,
-    si,
-    k,
-    q,
-    a,
-    p,
-    lam_ck,
-    eta_ck,
-    prior: bool = False,
-    chunk: int = DEFAULT_CHUNK,
-):
-    """Fused backward. Returns ``(dmsi, dsi, dk, dq, da, dp, dlam0, deta0)``."""
-    B, L, M = msi.shape
-    S = k.shape[2]
-    lib = fused_library(S, chunk)
-    n_ck = lam_ck.shape[2]
-
-    dev = msi.device
-    f32 = torch.float32
-    dmsi = torch.empty(B, L, M, device=dev, dtype=f32)
-    dsi = torch.empty(B, L, M, device=dev, dtype=f32)
-    dlam0 = torch.empty(B, M, S, device=dev, dtype=f32)
-    deta0 = torch.empty(B, M, S, device=dev, dtype=f32)
-    # dk/dq contract over channels and da/dp over batch and time; neither axis
-    # is owned by a single threadgroup, so these four are accumulated atomically
-    # and must start at zero.
-    dk = torch.zeros(B, L, S, device=dev, dtype=f32)
-    dq = torch.zeros(B, L, S, device=dev, dtype=f32)
-    da = torch.zeros(M, S, device=dev, dtype=f32)
-    dp = torch.zeros(M, S, device=dev, dtype=f32)
-
-    threads, group = _grid(B, M, S)
-    lib.kla_fused_bwd(
-        dk,
-        dq,
-        da,
-        dp,
-        dmsi,
-        dsi,
-        dlam0,
-        deta0,
-        dy,
-        dyvar,
-        dlam_fin,
-        deta_fin,
-        msi,
-        si,
-        k,
-        q,
-        a,
-        p,
-        lam_ck,
-        eta_ck,
-        L,
-        M,
-        S,
-        n_ck,
-        int(prior),
-        threads=threads,
-        group_size=group,
-    )
-    return dmsi, dsi, dk, dq, da, dp, dlam0, deta0
-
-
-class _FusedKLAScan(torch.autograd.Function):
-    """Autograd wrapper over the fused forward/backward Metal kernels."""
+class _RecurrentKLAScan(torch.autograd.Function):
+    """Serial-time Metal forward, with the shared exact backward behind it."""
 
     @staticmethod
     def forward(ctx, msi, si, k, q, a, p, lam0, eta0, prior, chunk):
         needs_grad = any(ctx.needs_input_grad)
-        y, yvar, lam_fin, eta_fin, lam_ck, eta_ck = fused_forward(
+        y, yvar, lam_fin, eta_fin, lam_ck, eta_ck = recurrent_forward(
             msi,
             si,
             k,
@@ -192,7 +126,7 @@ class _FusedKLAScan(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dy, dyvar, dlam_fin, deta_fin):
         msi, si, k, q, a, p, lam_ck, eta_ck = ctx.saved_tensors
-        dmsi, dsi, dk, dq, da, dp, dlam0, deta0 = fused_backward(
+        dmsi, dsi, dk, dq, da, dp, dlam0, deta0 = scan_backward(
             dy.contiguous(),
             dyvar.contiguous(),
             dlam_fin.contiguous(),
@@ -211,8 +145,8 @@ class _FusedKLAScan(torch.autograd.Function):
         return dmsi, dsi, dk, dq, da, dp, dlam0, deta0, None, None
 
 
-def fused_kla_scan(
+def recurrent_kla_scan(
     msi, si, k, q, a, p, lam0, eta0, prior: bool = False, chunk: int = DEFAULT_CHUNK
 ):
-    """Differentiable fused KLA scan → ``(y, y_var, lam_fin, eta_fin)``."""
-    return _FusedKLAScan.apply(msi, si, k, q, a, p, lam0, eta0, prior, chunk)
+    """Differentiable recurrent KLA scan → ``(y, y_var, lam_fin, eta_fin)``."""
+    return _RecurrentKLAScan.apply(msi, si, k, q, a, p, lam0, eta0, prior, chunk)

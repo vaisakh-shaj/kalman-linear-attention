@@ -1,14 +1,15 @@
 # Todo
 
-## MPS backend
+Backend and schedule coverage is done — all fifteen cells exist, each with an
+exact backward, state carry and prior decode. See `PLAN.md` for what has been
+run on real hardware and what is still only written, and
+`docs/implementations.md` for the matrix.
 
-- [x] Tiled parallel-scan forward (`mps_tiled`) — wins below ~6k lanes, i.e. batch-1 prefill on a narrow model
-- [ ] Backward for `mps_tiled`, if the tiled forward turns out to matter in practice
+## Measurement
 
-## CUDA backend
-
-- [ ] Exact gradients — replace the 4x4 Jacobian adjoint with a scalar reverse scan over lambda, as triton does
-- [ ] Carry the filter state — accept an initial state, return the final one, differentiate both ways
+- [ ] `cuda_chunk` vs `cuda_v2_2`: accuracy **and** wall-clock, on a CUDA device
+- [ ] Confirm `chunk` is the right default per device, or change the alias
+- [ ] Tune `KLA_CHUNK` / `KLA_ITEMS` / `BLOCK_L` per backend once the above runs
 
 ## Experiments
 

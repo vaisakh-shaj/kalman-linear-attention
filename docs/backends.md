@@ -5,43 +5,61 @@ By default `auto` is selected for the backend which tries to pick a performant o
 
 ## Overview
 
+Every backend carries all three schedules — `recurrent`, `chunk`, `pscan` — and
+a bare backend name means that backend's default, which is `chunk`. See
+[implementations.md](implementations.md) for what the schedules mean and for the
+full matrix. This page is about the backends themselves: what each needs, and
+when to pick it.
+
 ### Torch
 
-This is a portable reference that uses the inbuilt `torch._higher_order_ops.associative_scan`.
-The performance of this approach is currently suboptimal.
+Requires: nothing.
 
-It runs everywhere — CPU, CUDA, Apple silicon — its gradients are exact, and it
-is the only backend that runs in float64, which is what lets `gradcheck` test it.
+The portable reference. It runs everywhere — CPU, CUDA, Apple silicon — its
+gradients are exact, and it is the only backend that runs in float64, which is
+what lets `gradcheck` test it. It is also the only one with no `d_state`
+ceiling.
+
+All three torch cells are `unfused`: they build the `[B, L, M, S]` intermediates
+in memory, using `torch._higher_order_ops.associative_scan` and friends. That is
+the point — it is the readable version every kernel is checked against — but the
+performance is correspondingly suboptimal.
 
 ### Triton
 
-Requires: CUDA device and `triton` package
+Requires: CUDA device and the `triton` package.
 
-Almost as fast as the CUDA backend but more flexible and easier to setup.
-On an NVIDIA GPU, `auto` should select this backend and it should not require additional setup.
+Almost as fast as the CUDA backend, and far easier to set up: on an NVIDIA GPU
+`auto` selects triton and nothing else is needed. torch's own Linux wheels
+already ship triton.
 
-`triton` takes a single fused kernel when nothing needs an adjoint and tiled
-forward+backward scans otherwise. `triton_fused` and `triton_composed` pin one
-each, so a config can name the kernels rather than depend on whether autograd
-happened to be recording.
+This is the only backend with both families. `triton_<schedule>` is fused — one
+kernel, no `[B, L, M, S]` intermediates, an exact backward that replays from
+checkpoints. `triton_unfused_<schedule>` runs the same recurrences as standalone
+scan kernels with torch glue between them; it is slower by the HBM passes that
+glue costs, and it is the reference the fused cells are checked against.
 
 ### CUDA
 
-Requires: CUDA device and CUDA compiler
+Requires: CUDA device and a CUDA compiler (`nvcc`), which JIT-compiles the
+kernels on first use.
 
-Fastest backend on CUDA devices but setting up CUDA dependencies can be tricky.
+The fastest backend on CUDA devices, at the cost of a toolchain that can be
+fiddly to get right. The kernels target `sm_80` through `sm_90` and stay inside
+the 48 KB of shared memory a consumer Ampere/Ada part gives without an opt-in
+carveout, so one build covers a 4090 and an H200.
+
+`cuda_v2_1` and `cuda_v2_2` are earlier kernels kept beside the three scheme
+cells. They are the only implementations with an approximate backward, which is
+exactly why they are still here — they are the comparison for it.
 
 ### MPS
 
 Requires: Apple silicon GPU. The Metal shaders are compiled on first use by
-`torch.mps.compile_shader`.
+`torch.mps.compile_shader`, so there is no toolchain and no extra to install.
 
-`mps` is `mps_fused`: one kernel each way, exact gradients, state carried in and
-out. `mps_tiled` pins a forward-only kernel that parallelises over time instead
-— ~2x faster for batch-1 prefill on a narrow model, ~2.5x slower once the
-default has enough threads. `mps_composed` pins the triton-shaped scan kernels;
-it is far slower, and exists for `d_state` past the fused ceiling.
-
+All three cells are fused and share one backward. Metal has no float64, so
+`gradcheck` still needs `backend="torch"`.
 
 ## Installing
 
@@ -90,14 +108,23 @@ build command and log.
 
 ### Accuracy
 
-Every backend is checked against `kla.ops.kla_scan_reference`,
-a simple sequential implementation.
+Every implementation is checked against `kla.ops.kla_scan_reference`, a simple
+sequential implementation, in both directions.
 
-Every one of them is exact except the CUDA kernels, whose gradients through the
-precision scan land ~5–15 % off. That kernel differentiates its trace-normalized
-Möbius composition by carrying a 4-component adjoint through a chain of 4×4
-Jacobians; the composed matrix degenerates toward rank-1, so that carry is
-ill-conditioned in float32 even though the forward — a scale-invariant ratio of
-the same matrix — is not. It is a property of that kernel rather than of the
-algorithm: triton reaches ~3e-7 on the same hardware by carrying a *scalar*
-adjoint over `λ` instead.
+All of them are exact except `cuda_v2_1` and `cuda_v2_2`, whose gradients
+through the precision scan land ~5–15 % off. Those kernels differentiate their
+trace-normalized Möbius composition by carrying a 4-component adjoint through a
+chain of 4×4 Jacobians; the composed matrix degenerates toward rank-1, so that
+carry is ill-conditioned in float32 even though the forward — a scale-invariant
+ratio of the same matrix — is not.
+
+That is a property of those two kernels, not of the algorithm or of the
+schedule. Every other cell differentiates the *recurrence* instead, where
+`∂λ_t/∂λ_{t-1} = a²/den²` is a scalar, recovering `λ` from checkpoints rather
+than from the composed map. It is both exact and cheaper: those kernels already
+pay the forward recompute, and the Jacobian chain is added on top of it.
+
+This is why each backend has exactly one backward rather than one per schedule.
+The adjoint reads the state at the checkpoints, or the values `λ` and `η` — not
+the order a forward produced them in — so it is the same work whichever forward
+ran.

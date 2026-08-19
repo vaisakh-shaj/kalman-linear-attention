@@ -34,7 +34,8 @@ KLAConfig(d_state=16)  # and d_model, which you pass to the layer
 `d_state` is the one specific to KLA: how much the filter remembers. Memory and
 compute scale linearly in it, and 16 is a good default. Below 8 the filter starts
 to degenerate; above 64 you rarely gain. (64 is also the ceiling for the CUDA
-backend, and 128 for the fused MPS one.)
+kernels and 128 for the Metal ones; torch has none. The read-out sums over the
+state axis, so all of a channel's states have to sit in one block.)
 
 Everything else has a sensible default.
 
@@ -136,6 +137,10 @@ In paper notation the inputs are value `v` and value precision `Λ^v`
 time-invariant discrete decay `a` and process noise `p` (`[M, S]`). All three
 return `(y, y_var, final_state)`.
 
-`kla_scan` is the dispatcher — it takes `backend=`, plus `scan_impl` and
-`mobius_impl` for the torch path. `kla_step` is one recurrent step for decode.
-`kla_scan_reference` is the sequential loop every backend is validated against.
+`kla_scan` is the dispatcher. `backend=` takes an implementation name
+(`"mps_pscan"`), a bare backend name for that backend's default (`"mps"`), or
+`"auto"`; see [implementations.md](implementations.md) for the naming scheme.
+`mobius_impl=` is a torch-only knob for how the precision map is represented
+while it is composed. `kla_step` is one recurrent step for decode.
+`kla_scan_reference` is the sequential loop every implementation is validated
+against.

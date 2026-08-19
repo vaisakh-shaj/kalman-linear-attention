@@ -24,7 +24,9 @@ def make_inputs(device, B=2, L=64, M=16, S=8):
     return v, lambda_v, k, q, a, p
 
 
-@pytest.mark.parametrize("scan_impl", ["doubling", "associative", "sequential"])
+@pytest.mark.parametrize(
+    "scan_impl", ["doubling", "associative", "chunk", "sequential"]
+)
 def test_parallel_matches_reference(device, scan_impl):
     inputs = make_inputs(device)
     y_ref, v_ref, s_ref = kla_scan_reference(*inputs)

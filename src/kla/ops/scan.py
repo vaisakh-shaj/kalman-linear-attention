@@ -1,14 +1,18 @@
 """Generic associative-scan utilities for the pure-torch backend.
 
-Two interchangeable parallel implementations of an inclusive scan over tuples
-of tensors, plus a sequential reference:
+Four interchangeable implementations of an inclusive scan over tuples of
+tensors, one per *schedule* (see ``docs/implementations.md``):
 
 - ``associative``: ``torch._higher_order_ops.associative_scan`` (PyTorch 2.8+).
-- ``doubling``: vectorized Hillis–Steele doubling. O(L log L) work but only
-  elementwise ops and ~log2(L) kernel launches; works everywhere, fully
+  A pscan — the whole sequence at once, no serial carry.
+- ``doubling``: vectorized Hillis–Steele doubling. Also a pscan. O(L log L) work
+  but only elementwise ops and ~log2(L) kernel launches; works everywhere, fully
   autograd-compatible.
-- ``sequential``: python loop, used as a correctness reference and for short
-  sequences / decode.
+- ``chunk``: doubling inside a chunk, a serial carry across chunks. O(L) work
+  and O(L/C) serial steps, so it is the middle ground between the two above and
+  ``sequential``.
+- ``sequential``: python loop. The recurrent schedule — a correctness reference,
+  and what short sequences and decode want.
 
 All combine functions take ``(left, right)`` tuples where ``left`` is the
 earlier prefix, and return the composed element.
@@ -43,6 +47,41 @@ def doubling_scan(
         )
         offset *= 2
     return ys
+
+
+DEFAULT_CHUNK = 64
+"""Timesteps per chunk in :func:`chunk_scan`. Trades the serial carry (once per
+chunk) against the doubling scan's O(C log C) work inside one."""
+
+
+def chunk_scan(
+    combine_fn: CombineFn,
+    xs: Sequence[torch.Tensor],
+    dim: int,
+    chunk: int = DEFAULT_CHUNK,
+) -> tuple[torch.Tensor, ...]:
+    """Inclusive scan, chunked: parallel inside a chunk, serial across chunks.
+
+    The torch counterpart of the GPU ``chunk`` kernels. Each chunk is scanned
+    with :func:`doubling_scan`, then the previous chunk's last element is
+    composed into every element of this one — which is the serial carry, paid
+    once per chunk rather than once per timestep.
+    """
+    length = xs[0].size(dim)
+    blocks: list[tuple[torch.Tensor, ...]] = []
+    carry: tuple[torch.Tensor, ...] | None = None
+    for start in range(0, length, chunk):
+        width = min(chunk, length - start)
+        block = doubling_scan(
+            combine_fn, tuple(t.narrow(dim, start, width) for t in xs), dim
+        )
+        if carry is not None:
+            # The carry is the earlier prefix, so it goes on the left.
+            prefix = tuple(c.unsqueeze(dim).expand_as(b) for c, b in zip(carry, block))
+            block = combine_fn(prefix, block)
+        carry = tuple(t.select(dim, width - 1) for t in block)
+        blocks.append(block)
+    return tuple(torch.cat([b[i] for b in blocks], dim=dim) for i in range(len(xs)))
 
 
 def sequential_scan(
@@ -92,6 +131,8 @@ def resolve_scan(
         return associative_scan
     if scan_impl == "doubling":
         return doubling_scan
+    if scan_impl == "chunk":
+        return chunk_scan
     if scan_impl == "sequential":
         return sequential_scan
     raise ValueError(f"Unknown scan_impl: {scan_impl!r}")

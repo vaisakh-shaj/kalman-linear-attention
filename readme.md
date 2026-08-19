@@ -31,6 +31,8 @@ uv pip install kla    # or: uv add kla
 ```bash
 git clone https://github.com/vaisakh-shaj/kalman-linear-attention.git kla
 uv pip install ./kla
+# or
+uv sync
 ```
 
 Runs on CPU, NVIDIA GPUs and Apple silicon out of the box. To see what this
@@ -40,11 +42,13 @@ machine will use:
 python -m kla --check-backends
 ```
 
-For more details and other faster options see
-[docs/backends.md](docs/backends.md):
+The scan has four backends (torch, triton, cuda, mps) and three schedules each
+— see [docs/implementations.md](docs/implementations.md) for the naming and
+[docs/backends.md](docs/backends.md) for what each needs. For the fastest option
+on NVIDIA hardware:
 
 ```bash
-uv pip install "kla[triton]"
+uv pip install -U "kla[cuda]" # --torch-backend cu126
 ```
 
 ## Structure
@@ -54,7 +58,7 @@ This repository is split in two parts:
 - (Coming Soon) `experiments/` + `main.py` (with `nanochat/` and `mad/` submodules): Non-package code to reproduce the papers experiments.
 
 The ancillary parts are:
-- `docs/`: General documentation — [usage](docs/usage.md), [backends](docs/backends.md).
+- `docs/`: General documentation — [usage](docs/usage.md), [backends](docs/backends.md), [implementations](docs/implementations.md).
 - `tests/`: Unit tests for the package.
 
 ### Package

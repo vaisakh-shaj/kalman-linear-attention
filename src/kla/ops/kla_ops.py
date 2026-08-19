@@ -34,7 +34,7 @@ back to the working dtype.
 from __future__ import annotations
 
 import functools
-from typing import NamedTuple, Optional
+from typing import Callable, NamedTuple, Optional
 
 import torch
 
@@ -77,7 +77,7 @@ def _mobius_combine_tracenorm(left, right):
     """Compose two 2x2 Möbius matrices in LINEAR space, normalized by the trace.
 
     The plain-matmul counterpart of :func:`_mobius_combine_log`, and the same
-    scheme the triton kernels use (``tiled_mobius_scan._tracenorm_combine``).
+    scheme the triton kernels use (``unfused_kla_scan._tracenorm_combine``).
     Composing the maps is an ordinary 2x2 product; dividing all four entries by
     the trace afterwards keeps them O(1) without ever leaving linear space.
 
@@ -362,83 +362,132 @@ def kla_scan_reference(
     return torch.stack(ys, dim=1), torch.stack(yvars, dim=1), state
 
 
-def _backend_torch(*args, scan_impl="auto", mobius_impl="linear", **kwargs):
-    return kla_scan_torch(*args, scan_impl=scan_impl, mobius_impl=mobius_impl, **kwargs)
+# --------------------------------------------------------------- the registry
+#
+# One entry per implementation, named "<backend>[_unfused]_<schedule>" (see
+# docs/implementations.md). "fused" is the default and carries no token; a bare
+# backend name aliases that backend's default schedule, which is "chunk".
+#
+# The record carries only what the dispatcher and `python -m kla` actually read.
+# Everything in the contract -- forward, exact backward, state carry, prior
+# decode, fp32 -- is required of every implementation, so it is not a per-cell
+# flag. `exact_bwd` is the one exception: the two prior CUDA kernels are kept
+# precisely because they violate it, as the comparison for the exact ones.
 
 
-def _backend_triton(*args, **kwargs):
-    """Fused forward when nothing needs an adjoint, tiled scans otherwise."""
-    from kla.ops.triton_backend import kla_scan_triton
+class Impl(NamedTuple):
+    """One scan implementation: where it compiles and how it walks time."""
 
-    return kla_scan_triton(*args, **kwargs)
-
-
-def _backend_triton_fused(*args, **kwargs):
-    """Pin the fused triton forward — see :mod:`kla.ops.triton_backend`."""
-    from kla.ops.triton_backend import kla_scan_triton
-
-    return kla_scan_triton(*args, kernel="fused", **kwargs)
+    backend: str  # torch | triton | cuda | mps
+    schedule: str  # recurrent | chunk | pscan
+    fused: bool
+    max_d_state: Optional[int]  # None = no ceiling
+    exact_bwd: bool
+    fn: Callable
 
 
-def _backend_triton_composed(*args, **kwargs):
-    """Pin the tiled triton fwd+bwd scans — see :mod:`kla.ops.triton_backend`."""
-    from kla.ops.triton_backend import kla_scan_triton
+def _torch_scan(scan_impl: str) -> Callable:
+    """The torch backend at one schedule. `scan_impl` is now internal to it."""
 
-    return kla_scan_triton(*args, kernel="composed", **kwargs)
+    def run(*args, mobius_impl="linear", **kwargs):
+        return kla_scan_torch(
+            *args, scan_impl=scan_impl, mobius_impl=mobius_impl, **kwargs
+        )
 
-
-def _backend_cuda_v2_2(*args, **kwargs):
-    """The corrected kernel, named — see :mod:`kla.ops.cuda_backend`."""
-    from kla.ops.cuda_backend import kla_scan_cuda
-
-    return kla_scan_cuda(*args, kernel_version="v2_2", **kwargs)
+    return run
 
 
-def _backend_cuda_v2_1(*args, **kwargs):
-    """Harder ``phi`` clamp, not exact — see :mod:`kla.ops.cuda_backend`."""
-    from kla.ops.cuda_backend import kla_scan_cuda
+def _triton_scan(kernel: str) -> Callable:
+    def run(*args, **kwargs):
+        from kla.ops.triton_backend import kla_scan_triton
 
-    return kla_scan_cuda(*args, kernel_version="v2_1", **kwargs)
+        return kla_scan_triton(*args, kernel=kernel, **kwargs)
 
-
-def _backend_mps_fused(*args, **kwargs):
-    """One fused Metal kernel per pass — see :mod:`kla.ops.mps_backend`."""
-    from kla.ops.mps_backend import kla_scan_mps_fused
-
-    return kla_scan_mps_fused(*args, **kwargs)
+    return run
 
 
-def _backend_mps_tiled(*args, **kwargs):
-    """Time-parallel Metal forward — see :mod:`kla.ops.mps_backend`."""
-    from kla.ops.mps_backend import kla_scan_mps_tiled
+def _cuda_scan(kernel_version: str) -> Callable:
+    """One of the prior v2_* kernels, kept as the approximate-backward baseline."""
 
-    return kla_scan_mps_tiled(*args, **kwargs)
+    def run(*args, **kwargs):
+        from kla.ops.cuda_backend import kla_scan_cuda
 
+        return kla_scan_cuda(*args, kernel_version=kernel_version, **kwargs)
 
-def _backend_mps_composed(*args, **kwargs):
-    """Composed Metal scans + torch glue — see :mod:`kla.ops.mps_backend`."""
-    from kla.ops.mps_backend import kla_scan_mps_composed
-
-    return kla_scan_mps_composed(*args, **kwargs)
+    return run
 
 
-# One family per device, named after it, plus every implementation behind that
-# family under a "<family>_<impl>" name. The bare name is the family's default
-# implementation, so a config can either say "the good one for this device" or
-# pin an exact kernel; "auto" is the only value whose meaning depends on the
-# machine.
-_BACKENDS = {
-    "torch": _backend_torch,
-    "triton": _backend_triton,
-    "triton_fused": _backend_triton_fused,
-    "triton_composed": _backend_triton_composed,
-    "cuda": _backend_cuda_v2_2,  # the corrected kernel
-    "cuda_v2_2": _backend_cuda_v2_2,
-    "cuda_v2_1": _backend_cuda_v2_1,
-    "mps": _backend_mps_fused,
-    "mps_fused": _backend_mps_fused,
-    "mps_tiled": _backend_mps_tiled,
-    "mps_composed": _backend_mps_composed,
+def _cuda_exact(name: str) -> Callable:
+    def run(*args, **kwargs):
+        import kla.ops.cuda_backend as cuda
+
+        return getattr(cuda, name)(*args, **kwargs)
+
+    return run
+
+
+def _mps_scan(name: str) -> Callable:
+    def run(*args, **kwargs):
+        import kla.ops.mps_backend as mps
+
+        return getattr(mps, name)(*args, **kwargs)
+
+    return run
+
+
+_BACKENDS: dict[str, Impl] = {
+    # torch -- portable reference, the only one that runs float64
+    "torch_unfused_recurrent": Impl(
+        "torch", "recurrent", False, None, True, _torch_scan("sequential")
+    ),
+    "torch_unfused_chunk": Impl(
+        "torch", "chunk", False, None, True, _torch_scan("chunk")
+    ),
+    "torch_unfused_pscan": Impl(
+        "torch", "pscan", False, None, True, _torch_scan("auto")
+    ),
+    # triton
+    "triton_recurrent": Impl(
+        "triton", "recurrent", True, None, True, _triton_scan("recurrent")
+    ),
+    "triton_chunk": Impl("triton", "chunk", True, None, True, _triton_scan("chunk")),
+    "triton_pscan": Impl("triton", "pscan", True, None, True, _triton_scan("pscan")),
+    "triton_unfused_recurrent": Impl(
+        "triton", "recurrent", False, None, True, _triton_scan("unfused_recurrent")
+    ),
+    "triton_unfused_chunk": Impl(
+        "triton", "chunk", False, None, True, _triton_scan("unfused_chunk")
+    ),
+    "triton_unfused_pscan": Impl(
+        "triton", "pscan", False, None, True, _triton_scan("unfused_pscan")
+    ),
+    # cuda
+    "cuda_recurrent": Impl(
+        "cuda", "recurrent", True, 64, True, _cuda_exact("kla_scan_cuda_recurrent")
+    ),
+    "cuda_chunk": Impl(
+        "cuda", "chunk", True, 64, True, _cuda_exact("kla_scan_cuda_chunk")
+    ),
+    "cuda_pscan": Impl(
+        "cuda", "pscan", True, 64, True, _cuda_exact("kla_scan_cuda_pscan")
+    ),
+    # prior kernels, kept as the approximate-backward comparison
+    "cuda_v2_2": Impl("cuda", "chunk", True, 64, False, _cuda_scan("v2_2")),
+    "cuda_v2_1": Impl("cuda", "chunk", True, 64, False, _cuda_scan("v2_1")),
+    # mps
+    "mps_recurrent": Impl(
+        "mps", "recurrent", True, 128, True, _mps_scan("kla_scan_mps_recurrent")
+    ),
+    "mps_chunk": Impl("mps", "chunk", True, 128, True, _mps_scan("kla_scan_mps_chunk")),
+    "mps_pscan": Impl("mps", "pscan", True, 128, True, _mps_scan("kla_scan_mps_pscan")),
+}
+
+# A bare backend name is that backend's default schedule.
+_ALIASES = {
+    "torch": "torch_unfused_chunk",
+    "triton": "triton_chunk",
+    "cuda": "cuda_chunk",
+    "mps": "mps_chunk",
 }
 
 
@@ -462,25 +511,23 @@ def _mps_available() -> bool:
 
 # Device -> the backend "auto" picks there, if its kernels are importable. The
 # `cuda` kernels are deliberately absent: their backward is an approximate
-# adjoint, so they stay opt-in.
+# adjoint, so they stay opt-in until the exact cells land.
 _AUTO = (
     ("is_cuda", "triton", _triton_available),
     ("is_mps", "mps", _mps_available),
 )
 
 
-def _resolve_auto(x: torch.Tensor) -> str:
-    """The backend ``"auto"`` picks for tensors on ``x``'s device.
-
-    Device in, backend out — nothing about the *call* is consulted. A backend
-    that cannot serve a particular request raises and names one that can, rather
-    than being swapped out underneath you, so the kernels a run used are a
-    function of the config and the machine and nothing else.
-    """
-    for attr, backend, available in _AUTO:
-        if getattr(x, attr) and available():
-            return backend
-    return "torch"
+def resolve_impl(name: str, x: Optional[torch.Tensor] = None) -> str:
+    """Resolve ``"auto"`` and bare backend names to one implementation name."""
+    if name == "auto":
+        if x is None:
+            return _ALIASES["torch"]
+        for attr, backend, available in _AUTO:
+            if getattr(x, attr) and available():
+                return _ALIASES[backend]
+        return _ALIASES["torch"]
+    return _ALIASES.get(name, name)
 
 
 def kla_scan(
@@ -493,43 +540,42 @@ def kla_scan(
     *,
     initial_state: Optional[KLAState] = None,
     backend: str = "auto",
-    scan_impl: str = "auto",
     decode_from_prior: bool = False,
     mobius_impl: str = "linear",
 ):
-    """Dispatch the KLA scan to the requested backend.
+    """Dispatch the KLA scan to the requested implementation.
 
     Inputs in paper notation: value ``v``, value precision ``lambda_v`` (Λ^v),
     key ``k``, query ``q``, discrete decay ``a``, process noise ``p``.
 
-    "auto" is the only value that is not a fixed implementation: it reads the
-    device and nothing else (see :func:`_resolve_auto`). Every other name runs
-    exactly the kernels it says, so pass one to pin the code path.
+    ``backend`` takes an implementation name ("mps_recurrent"), a bare backend
+    name for that backend's default ("mps"), or "auto". "auto" is the only value
+    that is not a fixed implementation: it reads the device and nothing else, so
+    the kernels a run used are a function of the config and the machine and
+    nothing else. See docs/implementations.md for the naming scheme.
     """
-    if backend == "auto":
-        backend = _resolve_auto(v)
+    name = resolve_impl(backend, v)
     try:
-        fn = _BACKENDS[backend]
+        impl = _BACKENDS[name]
     except KeyError:
         raise ValueError(
-            f"Unknown backend {backend!r}; expected one of {sorted(_BACKENDS)}"
+            f"Unknown backend {backend!r}; expected 'auto', a backend name "
+            f"({', '.join(_ALIASES)}), or one of {sorted(_BACKENDS)}"
         ) from None
-    if backend == "torch":
-        # scan_impl / mobius_impl are torch-only knobs: the GPU backends have one
-        # scan shape and are already trace-normalized in linear space.
-        return fn(
-            v,
-            lambda_v,
-            k,
-            q,
-            a,
-            p,
-            initial_state=initial_state,
-            scan_impl=scan_impl,
-            decode_from_prior=decode_from_prior,
-            mobius_impl=mobius_impl,
+
+    S = k.shape[2]
+    if impl.max_d_state is not None and S > impl.max_d_state:
+        raise NotImplementedError(
+            f"{name} supports d_state <= {impl.max_d_state} (got {S}); "
+            "use backend='torch', which has no ceiling."
         )
-    return fn(
+
+    kwargs = {}
+    if impl.backend == "torch":
+        # mobius_impl is a torch-only knob: the GPU kernels are hard-wired to
+        # the linear, trace-normalized composition.
+        kwargs["mobius_impl"] = mobius_impl
+    return impl.fn(
         v,
         lambda_v,
         k,
@@ -538,16 +584,27 @@ def kla_scan(
         p,
         initial_state=initial_state,
         decode_from_prior=decode_from_prior,
+        **kwargs,
     )
 
 
 def backend_names() -> tuple:
-    """Every backend :func:`kla_scan` accepts, in dispatch order.
+    """Every implementation name :func:`kla_scan` accepts, in dispatch order.
 
-    Read off the dispatch table itself, so it cannot drift from what
-    ``backend=`` will take.
+    Read off the registry itself, so it cannot drift from what ``backend=``
+    will take. Bare backend names (see :data:`_ALIASES`) are accepted too.
     """
     return tuple(_BACKENDS)
+
+
+def implementations() -> dict:
+    """The registry: implementation name -> :class:`Impl`."""
+    return dict(_BACKENDS)
+
+
+def backend_aliases() -> dict:
+    """Bare backend name -> the implementation it currently resolves to."""
+    return dict(_ALIASES)
 
 
 def default_device() -> str:
@@ -560,7 +617,7 @@ def default_device() -> str:
 
 
 def resolve_backend(device=None) -> str:
-    """The backend ``backend="auto"`` resolves to for tensors on ``device``."""
+    """The implementation ``backend="auto"`` resolves to on ``device``."""
     if device is None:
         device = default_device()
-    return _resolve_auto(torch.empty(0, device=device))
+    return resolve_impl("auto", torch.empty(0, device=device))
