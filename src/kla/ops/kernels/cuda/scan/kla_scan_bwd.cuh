@@ -1,5 +1,5 @@
 /******************************************************************************
- * The CUDA backward -- one exact adjoint for every CUDA schedule.
+ * The CUDA backward -- one exact adjoint for every CUDA implementation.
  *   kla_scan_bwd.cuh
  *
  * An adjoint does not have to mirror its forward. All this kernel needs is

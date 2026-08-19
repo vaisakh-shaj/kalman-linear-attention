@@ -127,7 +127,7 @@ def pscan_library(d_state: int, chunk: int = DEFAULT_CHUNK):
 
     ``chunk`` is both the reduce-then-scan's chunk length and the checkpoint
     stride here — the same number, because the states entering each chunk *are*
-    the checkpoints this schedule already computes.
+    the checkpoints this implementation already computes.
     """
     _require_dstate(d_state, "mps_pscan")
     block_s, rows = tile_geometry(d_state)
@@ -135,7 +135,7 @@ def pscan_library(d_state: int, chunk: int = DEFAULT_CHUNK):
 
 
 def bwd_library(d_state: int, chunk: int = DEFAULT_CHUNK):
-    """The backward both schedules share. Lane-per-state, like the recurrent
+    """The backward both implementations share. Lane-per-state, like the recurrent
     forward, whatever geometry the forward that wrote the checkpoints used."""
     _require_dstate(d_state, "the MPS backward")
     block_s, rows = launch_geometry(d_state)

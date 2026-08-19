@@ -10,8 +10,9 @@ from __future__ import annotations
 import dataclasses
 from typing import Literal, Optional, Union
 
-# Implementations are named "<backend>[_unfused]_<schedule>", where the schedule
-# is how the kernel gets through the sequence: recurrent, chunk or pscan. A bare
+# Implementations are named "<backend>[_unfused]_<implementation>", where the
+# implementation is how the kernel gets through the sequence: recurrent, chunk
+# or pscan. A bare
 # backend name is that backend's default. "auto" is the only value whose meaning
 # depends on the machine. See docs/implementations.md.
 Backend = Literal[
@@ -23,20 +24,26 @@ Backend = Literal[
     "mps",
     # torch
     "torch_unfused_recurrent",
+    "torch_unfused_chunk",
     "torch_unfused_pscan",
     # triton
     "triton_recurrent",
     "triton_chunk",
+    "triton_pscan",
+    "triton_unfused_recurrent",
     "triton_unfused_chunk",
+    "triton_unfused_pscan",
     # cuda
     "cuda_recurrent",
     "cuda_chunk",
+    "cuda_pscan",
     # prior kernels, the only ones with an approximate backward
     "cuda_v2_2",
     "cuda_v2_1",
     # mps
     "mps_recurrent",
     "mps_chunk",
+    "mps_pscan",
 ]
 MobiusImpl = Literal["linear", "log"]
 
@@ -198,13 +205,13 @@ class KLAConfig:
     backward is an approximate adjoint.
 
     Every other value pins a code path. "torch", "triton", "cuda" and "mps" are
-    their backend's default; a full "<backend>[_unfused]_<schedule>" name pins
+    their backend's default; a full "<backend>[_unfused]_<implementation>" name pins
     an exact one -- see docs/implementations.md and :func:`kla.ops.kla_scan`."""
 
     mobius_impl: MobiusImpl = "linear"
     """How the precision Möbius map is represented while it is composed. Torch
     backend only -- the triton and CUDA kernels are hard-wired to "linear".
-    Orthogonal to the schedule, which picks how the scan is parallelized.
+    Orthogonal to the implementation, which picks how the scan is parallelized.
 
     "linear"  (default) compose the 2x2 maps as plain matmuls normalized by the
               trace. No transcendentals in the combine, and the same scheme both

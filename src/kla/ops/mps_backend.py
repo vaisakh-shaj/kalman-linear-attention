@@ -18,7 +18,7 @@ which ships inside torch, so there is no toolchain and no extra dependency.
 
 Both are exact in the backward, and both carry the filter state in and out
 differentiably, where the equally-fused CUDA ``v2_*`` kernels do neither. That
-falls out of the schedule: ``mps_recurrent`` puts one thread on each
+falls out of the implementation: ``mps_recurrent`` puts one thread on each
 ``(batch, channel, state)`` triple and walks time serially, so the Möbius map is
 applied to a running λ rather than composed with its neighbours, which leaves
 the adjoint elementary (``∂λ_t/∂λ_{t-1} = 1/(a²·den²)``). ``mps_chunk`` then

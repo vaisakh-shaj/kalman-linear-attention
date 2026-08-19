@@ -1,16 +1,16 @@
 # Implementations
 
 One algorithm, several implementations of its core scan. Each one is named by
-two things: which **backend** compiles it, and which **schedule** it uses to get
+two things: which **backend** compiles it, and which **implementation** it uses to get
 through the sequence.
 
 ```
-<backend>[_unfused]_<schedule>
+<backend>[_unfused]_<implementation>
 ```
 
-## The three schedules
+## The three implementations
 
-The scan is a recurrence: step `t` needs step `t-1`. The three schedules are
+The scan is a recurrence: step `t` needs step `t-1`. The three implementations are
 three answers to "how much of the sequence can run at once?"
 
 ### recurrent
@@ -22,9 +22,15 @@ t:  0 → 1 → 2 → 3 → 4 → 5 → 6 → 7
 ```
 
 Parallelism comes from everything *else* — one thread per (batch, channel,
-state). Simple, and the cheapest per step, because the step just applies the
-update to a running value. Good when there are lots of sequences or channels to
-fill the GPU with. Bad when there are not.
+state). Good when there are lots of sequences or channels to fill the GPU with.
+Bad when there are not.
+
+It is also the cheapest per step: a serial walk can *apply* the update to a
+running value rather than compose two maps, which is about a quarter of the
+arithmetic and materializes nothing. Every `recurrent` cell does this, torch
+included — that one carries `(λ, η)` through
+`torch._higher_order_ops.scan`, so `mobius_impl` has nothing to choose between
+there because nothing is composed.
 
 ### chunk
 
@@ -54,8 +60,12 @@ Nothing is serial, so this fills the GPU even when there is only one short
 sequence. It costs more total work than `chunk` to get there. Worth it for
 batch-1 prefill of a long sequence, and rarely otherwise.
 
-**Rule of thumb:** `recurrent` when you have many sequences, `pscan` when you
-have one long one, `chunk` the rest of the time.
+**Rule of thumb:** the implementations split on how many lanes `B x d_inner x d_state`
+gives you, since that is `recurrent`'s entire grid. Measured on an M5 Pro:
+`recurrent` above ~4k lanes, `chunk` from ~512 to ~4k, `pscan` below that.
+Every realistic config is in `recurrent`'s range — 4k lanes is `d_model=128` at
+batch 1 — which is why it is the default on the two backends that have been
+measured. See [benchmarks/mps.md](benchmarks/mps.md).
 
 ## fused and unfused
 
@@ -68,7 +78,7 @@ and to change. It is the reference the fused versions are checked against.
 
 ## The matrix
 
-| | recurrent | chunk *(default)* | pscan |
+| | recurrent | chunk | pscan |
 |---|---|---|---|
 | **torch** | `torch_unfused_recurrent` | `torch_unfused_chunk` | `torch_unfused_pscan` |
 | **triton** | `triton_recurrent` | `triton_chunk` | `triton_pscan` |
@@ -76,12 +86,23 @@ and to change. It is the reference the fused versions are checked against.
 | **cuda** | `cuda_recurrent` | `cuda_chunk` | `cuda_pscan` |
 | **mps** | `mps_recurrent` | `mps_chunk` | `mps_pscan` |
 
-A bare backend name means that backend's default. `auto` picks the default for
-whichever device the tensors are on.
+A bare backend name means that backend's default:
+
+| backend | default | why |
+|---|---|---|
+| `torch` | `torch_unfused_recurrent` | measured — fastest in both regimes, and 4–9x the smallest footprint |
+| `mps` | `mps_recurrent` | measured — fastest at every shape past `d_model=128` |
+| `triton` | `triton_chunk` | not yet measured; `chunk` is the safe middle |
+| `cuda` | `cuda_chunk` | not yet measured; `chunk` is the safe middle |
+
+`auto` picks the default for whichever device the tensors are on. See
+[benchmarks/mps.md](benchmarks/mps.md) for the numbers behind the two that have
+been measured, including where `chunk` and `pscan` do win.
 
 Every cell in the table exists. Run `python -m kla --check-backends` for what
 *this* machine can actually run — a cell needs its toolchain and its device
-present — and see `PLAN.md` for what has been measured on real hardware.
+present — and see [rework-plan.md](rework-plan.md) for what has been measured
+on real hardware.
 
 `cuda_v2_1` and `cuda_v2_2` are earlier CUDA kernels, kept for comparison. They
 are the only implementations with an approximate backward.

@@ -1,7 +1,7 @@
 """Metal (MPS) kernels for the KLA scan.
 
-Three forwards, one per schedule, and one backward they share (see
-``docs/implementations.md`` for what the schedules mean):
+Three forwards, one per implementation, and one backward they share (see
+``docs/implementations.md`` for what the implementations mean):
 
 ``recurrent_kla_scan``
     ``mps_recurrent``. One thread per ``(b, m, s)``, time serial, the Möbius map

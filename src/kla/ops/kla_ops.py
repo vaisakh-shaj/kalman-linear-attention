@@ -38,7 +38,7 @@ from typing import Callable, NamedTuple, Optional
 
 import torch
 
-from kla.ops.scan import resolve_scan, sequential_scan  # noqa: F401
+from kla.ops.scan import resolve_scan
 
 EPS = 1e-12
 P_MIN = 1e-12  # floor on the process noise p
@@ -185,6 +185,51 @@ def _broadcast_ap(a, p, like):
     return a.to(like), p.clamp_min(P_MIN).to(like)
 
 
+def _recurrent_lambda_eta(phi, r, a, p, lam0, eta0):
+    """Both recurrences in one carry-based pass — *applied*, never composed.
+
+    The recurrent implementation proper, and the only torch path that matches what
+    ``recurrent`` means in the kernels::
+
+        den_t = a² + p·λ_{t-1};  λ_t = λ_{t-1}/den_t + φ_t;
+        η_t   = (a/den_t)·η_{t-1} + r_t
+
+    ``torch._higher_order_ops.scan`` carries ``(λ, η)`` along the sequence, so
+    there is no 2×2 matrix, no trace normalization and no prefix-product tensor
+    — about a quarter of the arithmetic of composing, and ``mobius_impl`` has
+    nothing to represent because nothing is composed. It also fuses what the
+    composing path has to do in two passes: the gain α_t reads λ_{t-1}, which a
+    carry already has in hand and an associative scan has to recover afterwards.
+
+    ``a`` and ``p`` are read from the closure. The HOP lifts them as additional
+    inputs and routes gradients back into them, which is what lets the whole
+    recurrence stay one graph node.
+    """
+    from torch._higher_order_ops.scan import scan as _scan
+
+    a2 = (a * a).clamp_min(EPS)
+
+    def step(carry, x):
+        lam_prev, eta_prev = carry
+        phi_t, r_t = x
+        den = (a2 + p * lam_prev).clamp_min(EPS)
+        lam = lam_prev / den + phi_t
+        eta = (a / den) * eta_prev + r_t
+        # The HOP forbids the carry and the stacked output aliasing.
+        return (lam, eta), (lam.clone(), eta.clone())
+
+    def dense(x):
+        # Canonical strides, not just `.contiguous()`: a size-1 dimension makes
+        # any stride contiguous as far as torch is concerned, and the HOP
+        # compares the carry's metadata literally.
+        return torch.empty_like(x, memory_format=torch.contiguous_format).copy_(x)
+
+    (lam_fin, eta_fin), (lam, eta) = _scan(
+        step, (dense(lam0), dense(eta0)), (phi.contiguous(), r.contiguous()), dim=1
+    )
+    return lam, eta, lam_fin, eta_fin
+
+
 def kla_scan_torch(
     v: torch.Tensor,
     lambda_v: torch.Tensor,
@@ -201,7 +246,9 @@ def kla_scan_torch(
 
     ``scan_impl`` picks *how* the scan is parallelized (see
     :func:`kla.ops.scan.resolve_scan`); ``mobius_impl`` picks how the precision
-    map is *represented* while it is composed. The two are orthogonal.
+    map is *represented* while it is composed. The two are orthogonal, except
+    that ``scan_impl="sequential"`` composes nothing — it takes the recurrent
+    path in :func:`_recurrent_lambda_eta` and ignores ``mobius_impl``.
 
     ``mobius_impl="linear"`` (default) composes the 2x2 maps as plain matmuls
     normalized by the trace -- no transcendentals in the combine, and the same
@@ -232,6 +279,24 @@ def kla_scan_torch(
         # associative_scan torch.compiles per sequence length, which thrashes the
         # dynamo cache under varying-length inference; doubling is compile-free.
         scan_impl = "doubling"
+    if scan_impl == "sequential":
+        # The recurrent implementation applies the map instead of composing it, so
+        # there is no combine to hand a generic scan and mobius_impl has
+        # nothing to represent. It also needs no phi floor: nothing takes a log.
+        phi, r = _sufficient_stats(v, lambda_v, k)
+        a_s = a.to(dtype)
+        p_s = p.clamp_min(P_MIN).to(dtype)
+        lam, eta, lam_fin, eta_fin = _recurrent_lambda_eta(phi, r, a_s, p_s, lam0, eta0)
+        var = 1.0 / lam.clamp_min(EPS)
+        mean = eta * var
+        if decode_from_prior:
+            a2_s = (a_s * a_s).clamp_min(EPS)
+            mean = a_s * mean
+            var = a2_s * var + p_s
+        y = torch.einsum("blms,bls->blm", mean, q)
+        y_var = torch.einsum("blms,bls->blm", var, q * q)
+        return y, y_var, KLAState(lam=lam_fin, eta=eta_fin)
+
     scan = resolve_scan(scan_impl)
     # The log-space combine takes phi.log(), so it needs the floor; the linear
     # one does not (see _sufficient_stats).
@@ -364,9 +429,9 @@ def kla_scan_reference(
 
 # --------------------------------------------------------------- the registry
 #
-# One entry per implementation, named "<backend>[_unfused]_<schedule>" (see
+# One entry per implementation, named "<backend>[_unfused]_<implementation>" (see
 # docs/implementations.md). "fused" is the default and carries no token; a bare
-# backend name aliases that backend's default schedule, which is "chunk".
+# backend name aliases that backend's default implementation, which is "chunk".
 #
 # The record carries only what the dispatcher and `python -m kla` actually read.
 # Everything in the contract -- forward, exact backward, state carry, prior
@@ -379,7 +444,7 @@ class Impl(NamedTuple):
     """One scan implementation: where it compiles and how it walks time."""
 
     backend: str  # torch | triton | cuda | mps
-    schedule: str  # recurrent | chunk | pscan
+    implementation: str  # recurrent | chunk | pscan
     fused: bool
     max_d_state: Optional[int]  # None = no ceiling
     exact_bwd: bool
@@ -387,7 +452,7 @@ class Impl(NamedTuple):
 
 
 def _torch_scan(scan_impl: str) -> Callable:
-    """The torch backend at one schedule. `scan_impl` is now internal to it."""
+    """The torch backend at one implementation. `scan_impl` is now internal to it."""
 
     def run(*args, mobius_impl="linear", **kwargs):
         return kla_scan_torch(
@@ -482,12 +547,15 @@ _BACKENDS: dict[str, Impl] = {
     "mps_pscan": Impl("mps", "pscan", True, 128, True, _mps_scan("kla_scan_mps_pscan")),
 }
 
-# A bare backend name is that backend's default schedule.
+# A bare backend name is that backend's default implementation. `chunk` was the
+# placeholder everywhere; torch and mps have been measured since (see
+# docs/benchmarks/mps.md) and both moved to `recurrent`, which won every shape
+# either is realistically used at. triton and cuda are still unmeasured.
 _ALIASES = {
-    "torch": "torch_unfused_chunk",
+    "torch": "torch_unfused_recurrent",
     "triton": "triton_chunk",
     "cuda": "cuda_chunk",
-    "mps": "mps_chunk",
+    "mps": "mps_recurrent",
 }
 
 

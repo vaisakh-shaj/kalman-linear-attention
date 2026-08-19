@@ -348,7 +348,7 @@ def main(
                 fused = "fused  " if impl.fused else "unfused"
                 print(
                     f"        {cell:<{cell_width}}  {fused}  "
-                    f"{impl.schedule:<9}  {cap}{note}{default}"
+                    f"{impl.implementation:<9}  {cap}{note}{default}"
                 )
         print("\n  [X] = what backend='auto' resolves to here")
         print(

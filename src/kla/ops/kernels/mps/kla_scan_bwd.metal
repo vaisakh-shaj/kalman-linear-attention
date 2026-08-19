@@ -1,5 +1,5 @@
 /******************************************************************************
- * The Metal backward -- one exact adjoint for both MPS schedules.
+ * The Metal backward -- one exact adjoint for both MPS implementations.
  *   kla_scan_bwd.metal
  *
  * An adjoint does not have to mirror its forward. All this kernel needs is

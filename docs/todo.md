@@ -1,14 +1,16 @@
 # Todo
 
-Backend and schedule coverage is done — all fifteen cells exist, each with an
-exact backward, state carry and prior decode. See `PLAN.md` for what has been
+Backend and implementation coverage is done — all fifteen cells exist, each with an
+exact backward, state carry and prior decode. See `docs/rework-plan.md` for what has been
 run on real hardware and what is still only written, and
 `docs/implementations.md` for the matrix.
 
 ## Measurement
 
-- [ ] `cuda_chunk` vs `cuda_v2_2`: accuracy **and** wall-clock, on a CUDA device
-- [ ] Confirm `chunk` is the right default per device, or change the alias
+- [x] Apple silicon — `docs/benchmarks/mps.md`. Moved the `torch` and `mps`
+      aliases to `recurrent`; `chunk` turned out to be never optimal for torch.
+- [ ] The same sweep on a CUDA device, for the `triton` and `cuda` aliases
+- [ ] `cuda_chunk` vs `cuda_v2_2`: accuracy **and** wall-clock
 - [ ] Tune `KLA_CHUNK` / `KLA_ITEMS` / `BLOCK_L` per backend once the above runs
 
 ## Experiments

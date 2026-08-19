@@ -296,7 +296,7 @@ def kla_scan_cuda(
 # ------------------------------------------------------------ the exact scans
 #
 # The three scheme cells and the exact backward they share, under
-# kernels/cuda/scan/. Only the forward schedule differs between them; v2_1 and
+# kernels/cuda/scan/. Only the forward implementation differs between them; v2_1 and
 # v2_2 above stay as the approximate-backward comparison. Same algebra,
 # different adjoint -- see kla_scan_bwd.cuh for why differentiating the
 # recurrence is both exact and cheaper than differentiating the composition.
@@ -341,15 +341,15 @@ def _load_scan_extension():
 
 
 class _CudaKLAScan(torch.autograd.Function):
-    """One forward schedule, and the backward every schedule shares."""
+    """One forward implementation, and the backward every implementation shares."""
 
     @staticmethod
-    def forward(ctx, msi, si, k, q, a, p, lam0, eta0, prior, schedule):
+    def forward(ctx, msi, si, k, q, a, p, lam0, eta0, prior, implementation):
         ext = _load_scan_extension()
-        fwd = getattr(ext, f"{schedule}_fwd")
+        fwd = getattr(ext, f"{implementation}_fwd")
         args = (msi, si, k, q, a, p, lam0, eta0)
-        if schedule == "pscan":
-            # The checkpoints are that schedule's own scan intermediates, so
+        if implementation == "pscan":
+            # The checkpoints are that implementation's own scan intermediates, so
             # there is nothing for a flag to skip and it does not take one.
             out = fwd(*args, prior)
         else:
@@ -383,8 +383,8 @@ class _CudaKLAScan(torch.autograd.Function):
         return (*grads, None, None)
 
 
-def _cuda_scan(schedule: str):
-    """Build one exact CUDA cell. Only the forward schedule differs."""
+def _cuda_scan(implementation: str):
+    """Build one exact CUDA cell. Only the forward implementation differs."""
 
     def run(
         v: torch.Tensor,
@@ -423,13 +423,13 @@ def _cuda_scan(schedule: str):
             state.lam.float().contiguous(),
             state.eta.float().contiguous(),
             decode_from_prior,
-            schedule,
+            implementation,
         )
         return y, y_var, KLAState(lam=lam_fin, eta=eta_fin)
 
-    run.__name__ = f"kla_scan_cuda_{schedule}"
+    run.__name__ = f"kla_scan_cuda_{implementation}"
     run.__doc__ = (
-        f"``cuda_{schedule}``. Same contract as :func:`kla.ops.kla_scan_torch`."
+        f"``cuda_{implementation}``. Same contract as :func:`kla.ops.kla_scan_torch`."
     )
     return run
 

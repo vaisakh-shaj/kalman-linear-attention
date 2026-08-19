@@ -1,299 +1,203 @@
-# KLA backend/implementation rework
+# The merged 3x3 formulation
 
-Rename the scan implementations onto a two-axis scheme, then fill the matrix so
-every cell has a forward, an exact backward, state carry and prior decode.
+Fold the precision scan and the information-vector scan into **one** associative
+scan, by writing the whole step as a single 3x3 linear map in homogeneous
+coordinates. Add it as a third value on the fusion axis, called `merged`.
 
-**Priority is coverage.** Get every cell existing and correct. Tune each one
-later, on the hardware that matters for it.
-
-**No back-compat.** Old backend names, `scan_impl`, and deprecation shims are
-deleted outright, not aliased. Nothing in the repo is released, so a clean break
-costs nothing and the alternative is boilerplate that outlives its purpose.
+Status: designed and validated numerically, **not implemented**.
 
 ---
 
-## The scheme
+## The algebra
 
-Name: `<backend>[_unfused]_<schedule>`. Fused is the default and carries no
-token. A bare `<backend>` is a fixed alias for `<backend>_chunk`.
+`λ` is already projective: with `λ = u/v` the precision step is the 2x2 Möbius
+matrix the kernels compose today. The claim is that `η` rides in the same
+coordinates.
 
-| | recurrent | chunk *(default)* | pscan |
+From `C = p/a²`, `D = 1`:
+
+```
+v_t = C·u_{t-1} + D·v_{t-1} = (p·u_{t-1} + a²·v_{t-1}) / a² = den_t·v_{t-1} / a²
+```
+
+so the gain is a ratio of the coordinate the other scan already carries:
+
+```
+α_t = a / den_t = v_{t-1} / (a · v_t)
+```
+
+Put `w = v·η`. The `v_t` cancels and the whole step is linear:
+
+```
+w_t = v_t·η_t = v_t·α_t·η_{t-1} + v_t·r_t = (1/a)·w_{t-1} + r_t·v_t
+
+[u]   [ A     B     0  ] [u]        A = (1+pφ)/a²    B = φ
+[v] = [ C     D     0  ] [v]        C = p/a²         D = 1
+[w]   [r·C   r·D   1/a ] [w]        λ = u/v,  η = w/v
+```
+
+Lower block-triangular, two structural zeros, and a constant `(3,3)`.
+Composition is `[[P,0],[q,s]]`:
+
+```
+P = P₂·P₁          q = q₂·P₁ + s₂·q₁          s = s₂·s₁
+```
+
+**Normalization is load-bearing.** `s` accumulates `a⁻ⁿ`, which overflows fp32
+outright for a decaying filter — measured 7e142 at `a=0.5`, L=200, unnormalized.
+Dividing the whole 3x3 by the 2x2's trace fixes it, because `λ = u/v` and
+`η = w/v` are both invariant under a common rescale of `(u,v,w)`, and `∏τ` grows
+faster than `a⁻ⁿ`. `s` then *decays* to zero, which is the right physics — the
+initial `η` stops mattering. The 2x2 block stays bounded by 1, exactly as now.
+
+`D = 1 - A` after trace normalization, so the carried state is six values
+(`A, B, C, qa, qb, s`) against today's `4 + 2`.
+
+### Already validated
+
+Prototype: `scratch/fused3x3.py`, `scratch/compare2v3.py` (not in the repo).
+
+- Correct: float64 vs the sequential reference, L=200 — `λ` 6e-16, `η` 1e-12.
+- fp32 stability: normalized `s` decays; unnormalized it overflows.
+- No worse than today: fp32 against a float64 reference, decays 0.3/0.7/0.95,
+  lengths 8/16/64/128. `λ` bit-identical (same 2x2 block), `η` equal or better
+  at every point — e.g. decay 0.3 at L=128, `3.1e-4` today vs `4.6e-5` merged.
+
+**Re-run these as a repo test before writing a kernel.** The whole design rests
+on the normalization argument, and it is one line to get wrong.
+
+## Why it is worth doing
+
+Not the arithmetic — that is a wash, ~15 multiplies per compose against ~14 for
+the 2x2-plus-affine pair. It is the **dependency**.
+
+Today `α_t` needs `λ_{t-1}`, so the affine leaves do not exist until the Möbius
+scan has produced `λ`. Every composing implementation therefore runs two scans,
+and everything about their structure follows from that. The merged leaf is built
+from `(φ, r, a, p)` alone, so the dependency disappears.
+
+`recurrent` never had this problem — it *applies* the map, which hands it
+`λ_{t-1}` for free. So `merged` is what gives the composing implementations back
+the one-pass property the recurrent one always had.
+
+## Naming: `merged` on the fusion axis
+
+`<backend>[_unfused|_merged]_<implementation>`. `fused` stays the default and
+carries no token. The axis reads as an ordering of how much is combined:
+
+| | intermediates | scans |
+|---|---|---|
+| `unfused` | `[B,L,M,S]` in memory | two |
+| `fused` | per-chunk only | two |
+| `merged` | per-chunk only | **one** |
+
+**`merged` does not apply to `recurrent`.** That implementation applies rather
+than composes, so it already does `λ` and `η` in one pass; a merged variant
+would be the same kernel under a second name, which is the defect this whole
+naming scheme exists to prevent. Four new cells per backend at most:
+
+| | recurrent | chunk | pscan |
 |---|---|---|---|
-| **torch** | `torch_unfused_recurrent` | `torch_unfused_chunk` | `torch_unfused_pscan` |
-| **triton** | `triton_recurrent` | `triton_chunk` | `triton_pscan` |
-| **triton, unfused** | `triton_unfused_recurrent` | `triton_unfused_chunk` | `triton_unfused_pscan` |
-| **cuda** | `cuda_recurrent` | `cuda_chunk` | `cuda_pscan` |
-| **mps** | `mps_recurrent` | `mps_chunk` | `mps_pscan` |
-| **cuda, prior work** | — | `cuda_v2_1`, `cuda_v2_2` | — |
+| **fused** | `<b>_recurrent` | `<b>_chunk` | `<b>_pscan` |
+| **merged** | — *(identical to fused)* | `<b>_merged_chunk` | `<b>_merged_pscan` |
 
-See `docs/implementations.md` for what the three schedules mean.
+Open: whether torch gets `torch_merged_chunk` / `torch_merged_pscan`. Torch has
+no fused cells, so `merged` there would mean "unfused, but one scan" — which the
+single axis cannot express. Either accept that torch's `merged` implies unfused,
+or leave torch out.
 
-`cuda_v2_1` and `cuda_v2_2` stay as they are. They are the only cells with an
-approximate backward, which is exactly what makes them worth keeping: they are
-the comparison for the exact-versus-approximate measurement.
+## What changes, per implementation
 
-## Contract
+### chunk — the bigger win
 
-Every cell in the scheme must have:
+Six phases collapse to three. D and E exist *only* to build the affine leaves
+that C's `λ` unlocked.
 
-- forward and backward
-- exact backward — `exact_grads = INPUT_NAMES`, `exact_grad_tol <= 1e-2`
-- state carry in and out, differentiable both ways
-- `decode_from_prior`
-- fp32 scan
-- a declared `max_d_state`
+| today | merged |
+|---|---|
+| A compose Möbius leaves | A compose 3x3 leaves |
+| B tile scan (Möbius) | B tile scan, once |
+| C walk applying → `λ, α, r` | C walk applying → `λ, η`, read out |
+| D compose affine leaves | — |
+| E tile scan (affine) | — |
+| F walk applying → `η`, read out | — |
 
-A cell that misses one has a bug, not a variant. `cuda_v2_1` / `cuda_v2_2` are
-the two exceptions, and they declare `exact_bwd=False`.
+Three concrete effects:
 
-## Design rules
+- **One threadgroup scan instead of two.** `kla_tile_scan_mobius` and
+  `kla_tile_scan_affine` are each `log2(ROWS)` Hillis-Steele rounds with two
+  barriers per round. Halved, along with the two `kla_tile_broadcast` calls.
+- **The per-thread arrays disappear.** `var_h[ITEMS]`, `alpha_h[ITEMS]`,
+  `r_h[ITEMS]` in `chunk_kla_scan.metal` exist only to carry phase C's output to
+  D and F. That is 24 registers per thread at `ITEMS=8`, freed — and occupancy
+  is the entire reason the chunk implementation exists.
+- **A numerical trick becomes unnecessary.** `chunk_kla_scan.py` recovers
+  `λ_{t-1} = (D·λ_t − B)/(A − C·λ_t)` by inverting the leaf, specifically so the
+  α-gain needs no cross-chunk `λ` shift. Merged never forms `α`, so the
+  inversion and its stability argument both go.
 
-**Exactness comes from the backward, not the schedule.** Do not differentiate
-the Möbius composition. Recover `λ_t` from a checkpoint replay, then run one
-reverse scan carrying a *scalar* adjoint:
+### pscan
 
-```
-ν_t = ḡ_t + gain_{t+1}·ν_{t+1},    gain_t = (A·D − B·C)/den² = 1/(a²·den²)
-```
+Five kernels to three: one reduce, one set of doubling rounds, one apply. The
+second reduce-scan-apply round disappears with the dependency that forced it.
 
-This is cheaper than the 4×4 Jacobian chain in `cuda/v2_2`, not more expensive:
-that kernel already pays the forward recompute, and adds ~64 MACs/step plus
-`kNThreads × 16` floats of shared memory on top.
+Memory is roughly a wash — the aggregate goes from `4 + 2` floats to `6`, and
+both are ping-ponged.
 
-**`d_state <= 32` is the fast path.** 32 is one warp on CUDA and one SIMD-group
-on Metal, so the read-out reduction is a register shuffle with no shared memory.
-Design for it first; 33–64 takes the shared-memory fallback.
+### torch
 
-**Portability: consumer Ampere through H200, one kernel.** Budget ≤48 KB shared
-memory per block and take no opt-in carveout — sizing for H200's 228 KB/SM
-silently fails to launch on a 4090. Target `sm_80, 86, 89, 90`. Avoid sm_90-only
-features: wgmma, TMA / `cp.async.bulk`, thread-block clusters, distributed
-shared memory. The scan is fp32 scalar FMA work, so no tensor-core path applies
-anyway.
+`chunk_scan` in `scan.py` runs the Möbius scan, materializes `λ`, derives `α`,
+then scans again. Same halving, and it is the cheapest place to prototype the
+combine.
 
-**Precision.** The scan is fp32. No GEMM is fused into any scan kernel — every
-`nn.Linear` sits outside the `autocast(enabled=False)` region in
-`kla_layer.py`, so autocast already gives them fp16/bf16. Nothing to do; an fp16
-scan later becomes a per-cell `scan_dtype`.
+## Checklist
 
-**`max_d_state` is declared, not worked around.** No state-axis tiling, no
-auto-reroute. Above the cap, raise and name a cell that fits. Real configs use
-`d_state <= 32`, which is 2–4× below every cap.
+### Phase 0 — pin the algebra
 
----
+- [ ] `tests/test_merged_algebra.py`: the float64 identity, the fp32 comparison
+      against the two-scan composition, and an explicit overflow test showing
+      the unnormalized form failing. This is the load-bearing test.
+- [ ] Decide the carried layout: 6 values with `D = 1 - A`, or 7 with `D` kept.
+      Measure — the reconstruct costs an add, the extra word costs a register.
 
-## Phase 0 — Registry, naming, config ✅
+### Phase 1 — torch first, where it is cheapest to be wrong
 
-- [x] `Impl` record in `kla_ops.py`: `backend`, `schedule`, `fused`,
-      `max_d_state`, `exact_bwd`, `fn`. Six fields, all load-bearing.
-- [x] `_BACKENDS` maps cell name → `Impl`. `backend_names()` reads it.
-- [x] `Backend` literal in `configs.py` rewritten to the scheme names.
-- [x] Bare `<backend>` aliases resolve through `_ALIASES`.
-- [x] `ScanImpl` and `KLAConfig.scan_impl` deleted.
-- [x] `mobius_impl` kept — different axis (algebra), torch-only.
-- [x] `resolve_impl` / `resolve_backend` pick the device's default cell.
-- [x] `__main__.py` groups by `Impl.backend`, not `name.split("_", 1)`.
-- [x] `--check-backends` rewritten: capability rows for available backends,
-      names only for unavailable ones, uniform contract as a footer.
-- [x] `PROFILES` re-keyed in `tests/test_backends.py`.
-- [x] Other tests updated. 214 pass, ruff clean.
+- [ ] `_merged_combine` in `kla_ops.py`, next to `_mobius_combine_tracenorm`
+- [ ] `torch_merged_chunk`, `torch_merged_pscan` (pending the naming question)
+- [ ] Parity against `kla_scan_reference` at the existing tolerances
 
-### Kernel source names
+### Phase 2 — kernels
 
-Renamed onto the scheme, since "tiled" and "fused" said nothing about which
-cell a file served — and the shared backward living in a file called *fused*
-was the same confusion:
+- [ ] `mps_merged_chunk` — do this one first. It is the only backend that can be
+      run here, and the chunk kernel is where the structural win is largest.
+- [ ] `mps_merged_pscan`
+- [ ] `triton_merged_chunk`, `triton_merged_pscan`
+- [ ] `cuda_merged_chunk`, `cuda_merged_pscan`
+- [ ] Backward: **unchanged, and confirm it stays unchanged.** It replays from
+      `[B,M,NCK,S]` checkpoints and never sees a composed map, so `merged` must
+      not touch it. If it does, something has leaked.
 
-| was | is | serves |
-|---|---|---|
-| `chunk_kla_scan.metal` (fwd) | `recurrent_kla_scan.metal` | `mps_recurrent` |
-| `chunk_kla_scan.metal` (bwd) | `kla_scan_bwd.metal` | **both cells** |
-| `tiled_kla_scan.metal` | `chunk_kla_scan.metal` | `mps_chunk` |
+### Phase 3 — measure
 
-Kernel entry points followed: `kla_recurrent_fwd`, `kla_chunk_fwd`,
-`kla_scan_bwd`. The `.py` wrappers and `_shaders.py` library builders match
-(`recurrent_library`, `chunk_library`, `bwd_library`). The CUDA sources were
-named to the same pattern from the start, and the triton ones were brought onto
-it in Phase 2:
+- [ ] `merged_chunk` vs `fused_chunk` at the shapes in
+      `docs/benchmarks/mps.md`. Expect a clear win.
+- [ ] `merged_chunk` vs `mps_recurrent` — the interesting one, see below.
+- [ ] Revisit the aliases if `merged_chunk` crosses `recurrent`.
+- [ ] Fold the result into `docs/benchmarks/mps.md` and
+      `docs/implementations.md`.
 
-| was | is | serves |
-|---|---|---|
-| `fused_kla_scan.py` | `chunk_kla_scan.py` | `triton_chunk` |
-| `fused_kla_bwd.py` | `kla_scan_bwd.py` | **all three fused cells** |
-| `tiled_mobius_scan.py` | `unfused_kla_scan.py` | all three unfused cells |
+## Open: the depth question, still parked
 
-Same defect in each case: "fused" and "tiled" named a *property* several files
-share rather than the cell the file serves, and the shared backward living in a
-file called *fused* was the worst of it.
+Separate from this work, and unaffected by it. The three fused `pscan` cells
+walk each chunk *serially* before any doubling starts — `range(16)` on mps and
+cuda, `range(64)` on triton — so depth is `C + log2(L/C) + C`, which is 41
+stages at L=8192 rather than 13. Two ways out:
 
-### Decisions taken during Phase 0
+- **A** — replace the serial within-chunk walk with a Hillis-Steele across
+  threads, as `triton_unfused_pscan` already does via `tl.associative_scan`.
+  Depth `log2 L`, memory unchanged, still fused.
+- **B** — no chunks at all, doubling in device memory over the whole sequence.
+  Depth `log2 L`, but it must materialize `[B,L,M,S]` — roughly 8x the memory,
+  and the cell stops being fused by this repo's definition.
 
-**Aliases are the end-goal values.** Every bare backend name resolves to
-`<backend>_chunk` (`torch` to `torch_unfused_chunk`). No transitional pointers.
-A backend whose chunk cell does not exist yet simply raises — the gap is the
-work, not a case to engineer around.
-
-**`mps_unfused_recurrent` dropped**, along with `lane_mobius_scan.{py,metal}`
-and `scan_library`. MPS has no uncapped cell now; above `d_state = 128` the
-refusal names `torch`.
-
-**Triton's grad-mode dispatch removed.** `backend="triton"` used to pick the
-fused kernel under no-grad and the composed one otherwise — the "different
-kernels under one name" defect this rework exists to remove. `kernel` is now
-`chunk` or `unfused_chunk`, each running what it names.
-
-**`scan_impl` survives inside `kla_scan_torch`.** Gone from `KLAConfig` and from
-`kla_scan`; the three torch cells are built by binding it. An implementation
-detail, not a user-facing knob.
-
-## Phase 1 — Shared machinery
-
-Build once per backend, instantiate three ways. Phase 2 rows depend on it.
-
-- [x] **MPS**: scalar-adjoint reverse scan + checkpoint replay — already in
-      `kla_fused_bwd`, and now shared. `mps_chunk`'s forward writes checkpoints
-      at the same stride and hands them straight to `scan_backward`, so the
-      chunk cell has an exact backward without a second adjoint kernel. This is
-      the pattern for triton and CUDA: **one backward per backend, not one per
-      schedule.**
-- [x] **triton**: `kernels/triton/kla_scan_bwd.py` — chunk-shaped replay from
-      `[B,M,NCK,S]` checkpoints, two reverse affine recurrences via
-      `tl.flip` + `tl.associative_scan`. **Written blind; not yet run.**
-- [x] **cuda**: `kernels/cuda/scan/kla_scan_bwd.cuh` — lane-per-state replay
-      from `[B,M,NCK,S]` checkpoints into fixed-size register buffers, two
-      reverse recurrences carrying one scalar each. **Written blind; not yet
-      compiled.**
-- [x] Reduce-then-scan skeleton for `pscan`: chunk reduce → scan the
-      `[B,M,NCK,S]` aggregates → apply and read out. Landed on MPS first, where
-      it can be run: `pscan_kla_scan.metal`. The scan over aggregates is
-      Hillis-Steele *across launches*, ping-ponging two buffers, so no
-      threadgroup ceiling bounds the sequence length. Two rounds are needed,
-      not one — the affine leaf `alpha_t` reads `lambda_{t-1}`, so it does not
-      exist until the Möbius scan has produced lambda.
-- [x] `d_state <= 32` warp / SIMD-group read-out, shared-memory fallback above.
-
-## Phase 2 — Coverage
-
-Each backend's `recurrent` cell lands first — cheapest exact backward, and it
-validates the shared machinery before the harder schedules use it.
-
-**torch** — unblocks the `chunk` default
-
-- [x] `torch_unfused_recurrent` — rename
-- [x] `torch_unfused_pscan` — rename
-- [x] `torch_unfused_chunk` — new `chunk_scan` in `scan.py`; `torch` now
-      aliases it, so the `chunk` default holds on torch
-
-**mps** — most complete today, so it proves the machinery
-
-- [x] `mps_recurrent` — rename, declare cap
-- [x] `mps_chunk` — backward added; gradients ~5e-7 vs the reference. `mps` now
-      aliases it, so the `chunk` default holds on MPS
-- [x] `mps_pscan` — new; five-kernel reduce-then-scan, checkpoints fall out of
-      the schedule so the shared backward runs behind it unchanged
-
-**triton**
-
-- [x] `triton_unfused_chunk` — rename
-- [x] `triton_recurrent` — new forward; reuses `kla_scan_bwd`. **Untested.**
-- [x] `triton_chunk` — backward + prior decode added. **Untested on hardware.**
-- [x] `triton_pscan` — new; five kernels, reuses `kla_scan_bwd`. **Untested.**
-- [x] `triton_unfused_recurrent` — new schedule in `unfused_kla_scan.py`,
-      which `tiled_mobius_scan.py` was renamed to. **Untested.**
-- [x] `triton_unfused_pscan` — new; reuses the fused cell's doubling rounds
-      rather than repeating them. **Untested.**
-
-**cuda** — `sm_80–90`, ≤48 KB smem, `d_state <= 32` fast path. Sources under
-`kernels/cuda/scan/`; `v2_*` untouched beside them.
-
-- [x] `cuda_recurrent` — new, exact backward. **Untested; needs nvcc.**
-- [x] `cuda_chunk` — new forward; reuses the backward above. **Untested.**
-- [x] `cuda_pscan` — new; the Metal pscan transcribed. **Untested.**
-- [ ] `cuda_v2_1` / `cuda_v2_2` — leave untouched
-
-## Where the matrix stands
-
-All fifteen cells exist, plus the two `cuda_v2_*` kept for comparison. Every
-cell has a forward, the exact backward its backend shares, state carry and
-prior decode.
-
-What has actually *run* is torch and mps — six cells, on this machine, against
-the sequential reference in both directions. The triton and cuda cells are
-written and not yet executed; see below for what that leaves unverified and in
-what order to suspect it.
-
-Two structural rules held everywhere, and are worth keeping when tuning:
-
-**One backward per backend, not one per schedule.** Each backend has exactly
-one adjoint, and adding a schedule needed no change to it. The adjoint reads
-the state at the checkpoints (fused) or the values λ and η (unfused) — neither
-depends on the order a forward produced them in.
-
-**`pscan` computes its own checkpoints.** "The state entering chunk c" is
-exactly what the scan over aggregates produces, so the checkpoints are free
-there rather than an extra store, and the shared backward runs behind it
-unchanged.
-
-## Validation of blind work
-
-`tests/test_adjoint_formulas.py` pins the blind work against autograd in
-float64, on CPU, in two layers:
-
-1. **The formulas** — the scalar gain, both source terms, the `da`/`dp`
-   factorings, the boundary grads. Matches to ~4e-16 with and without prior.
-2. **The chunked replay** — checkpoint before the step, constant-trip-count
-   replay, masked tail, reverse chunk walk. This is the structure `cuda` and
-   `mps` both implement literally, and it is checked at every alignment:
-   `L = 1, 15, 16, 17, 32, 40` against a stride of 16.
-
-So the mathematics *and* the structure are verified even where the kernels
-cannot run. What remains unverified is per-backend mechanics: indexing, thread
-masking, `tl.flip`, atomics, shared-memory reductions, the launch geometry. Run
-this file first when a kernel's gradients look wrong — it separates a mistake in
-the maths from a mistake in the indexing.
-
-Known risks in the untested triton kernels, in likely order:
-
-- `tl.associative_scan` inside `_pscan_*_reduce_kernel` and
-  `_pscan_*_apply_kernel`, where the aggregate is read as the last row of the
-  inclusive scan (`t == BLOCK_L - 1`). That is correct only because masked-off
-  rows load the identity — check that the `other=` values are right first.
-- Scalar `tl.where(live, vector, scalar)` in `pscan_kla_scan.py`: a scalar
-  condition broadcast over a `[BLOCK_S]` tile.
-- The clamped-address-plus-mask stores (`tc` rather than `t`) in the pscan
-  apply kernel.
-- The ping-pong in `_doubling` returning the wrong buffer when `n_ck == 1`
-  (zero rounds, so the reduce kernel's output is the answer).
-
-Known risks in the untested triton backward, in likely order:
-
-- `tl.flip(x, 0)` on a 2-D tile — API shape and axis semantics.
-- `tl.associative_scan` inside the `_reverse_affine` helper rather than inline.
-- The partial final chunk: leading flipped positions must pass the zero carry
-  through untouched.
-- `tl.atomic_add` on the `[B,L,S]` and `[M,S]` outputs under masking.
-
-Known risks in the untested CUDA kernels, in likely order:
-
-- The `float4` / `float2` views of the aggregate tensors in `pscan_fwd`
-  (`reinterpret_cast` over a `{B,M,NCK,S,4}` float tensor) — alignment holds
-  because torch allocations are 512-byte aligned, but nothing checks it.
-- `std::swap` on the ping-pong pointers, and which buffer holds the inclusive
-  prefix once the loop ends.
-
-- The `KLA_LAUNCH` / `KLA_DISPATCH_BLOCK_S` macro pair and the `LAUNCH_BODY`
-  it expands around — it is the least type-checked thing in the tree.
-- `__shfl_xor_sync(..., width=BLOCK_S)` segmenting the warp for `BLOCK_S < 32`.
-- The `BLOCK_S > 32` shared-memory reduction: every thread must reach every
-  `__syncthreads()`, which holds only because `n` is uniform across the block.
-- `#pragma unroll` actually keeping `lam_h`/`eta_h` in registers rather than
-  spilling to local memory. Check with `-Xptxas -v`.
-
-## Phase 3 — Docs and measurement
-
-- [x] `docs/implementations.md` — the scheme and the matrix
-- [x] Rewrite `docs/backends.md` against the new names
-- [x] Update `docs/usage.md` and `readme.md`
-- [x] Fold completed items out of `docs/todo.md`
-- [ ] Measure `cuda_chunk` vs `cuda_v2_2`: accuracy **and** wall-clock
-- [ ] Confirm `chunk` is the right default per device, or change the alias
+`merged` helps either way, so it lands first.

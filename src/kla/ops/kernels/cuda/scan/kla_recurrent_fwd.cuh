@@ -10,7 +10,7 @@
  *
  * Checkpoints. Every KLA_CHUNK steps the thread writes the (lambda, eta) it is
  * *about to* consume into [B, M, NCK, S]. kla_scan_bwd.cuh resumes from exactly
- * that, and the same layout and stride serve every CUDA schedule -- the adjoint
+ * that, and the same layout and stride serve every CUDA implementation -- the adjoint
  * does not care how the forward reached the checkpoint.
  ******************************************************************************/
 #pragma once

@@ -6,7 +6,7 @@
  * Every kernel is specialized on BLOCK_S = next_pow2(d_state) so the read-out
  * reduction unrolls to a fixed shape and the backward's replay buffers stay
  * fixed-size registers; ROWS follows from aiming a block at KLA_TG_THREADS.
- * What ROWS *means* differs per schedule -- channels stacked for recurrent,
+ * What ROWS *means* differs per implementation -- channels stacked for recurrent,
  * timesteps split for chunk, chunks stacked for pscan -- so each entry point
  * declares its own grid.
  *
@@ -42,7 +42,7 @@ void check(const torch::Tensor &t, const char *name) {
 }
 
 // A block is always [BLOCK_S, ROWS] aiming at KLA_TG_THREADS. What ROWS *means*
-// differs: for the recurrent schedule it stacks channels, for the chunk one it
+// differs: for the recurrent implementation it stacks channels, for the chunk one it
 // spans time, so each entry point declares its own grid. LAUNCH_BODY does that,
 // and this pair only supplies the two compile-time constants.
 #define KLA_LAUNCH(BS)                                                       \
@@ -174,7 +174,7 @@ std::vector<torch::Tensor> pscan_fwd(torch::Tensor msi, torch::Tensor si,
     auto eta_fin = torch::empty({B, M, S}, opts);
 
     // No `checkpoints` flag, unlike the other two forwards: the checkpoints are
-    // this schedule's own intermediates, so there is nothing to skip.
+    // this implementation's own intermediates, so there is nothing to skip.
     const int NCK = (L + KLA_CHUNK - 1) / KLA_CHUNK;
     auto lam_ck = torch::empty({B, M, NCK, S}, opts);
     auto eta_ck = torch::empty({B, M, NCK, S}, opts);
@@ -283,5 +283,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("chunk_fwd", &chunk_fwd, "KLA chunk forward, time-parallel (CUDA)");
     m.def("pscan_fwd", &pscan_fwd,
           "KLA parallel-scan forward, no serial carry (CUDA)");
-    m.def("bwd", &scan_bwd, "KLA exact backward, shared by every schedule (CUDA)");
+    m.def("bwd", &scan_bwd, "KLA exact backward, shared by every implementation (CUDA)");
 }

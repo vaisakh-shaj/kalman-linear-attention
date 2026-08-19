@@ -259,6 +259,14 @@ class KLALayer(nn.Module):
         eta0 = ssm_state.eta if ssm_state is not None else None
         with torch.autocast(device_type=z.device.type, enabled=False):
             if cfg.checkpoint_ssm and torch.is_grad_enabled() and self.training:
+                # use_reentrant=True, not the modern default. The non-reentrant
+                # path recomputes the forward under a TorchDispatchMode, and
+                # torch's `scan` higher-order op -- which the torch recurrent
+                # cell is built on -- compiles its combine function at call
+                # time and cannot be traced through one. Reentrant simply reruns
+                # the forward, which the op is fine with. Everything this wraps
+                # has inputs that require grad and returns tensors, so the
+                # reentrant version's restrictions do not bite here.
                 y, y_var, new_state = torch.utils.checkpoint.checkpoint(
                     scan,
                     v,
@@ -267,7 +275,7 @@ class KLALayer(nn.Module):
                     q,
                     lam0,
                     eta0,
-                    use_reentrant=False,
+                    use_reentrant=True,
                 )
             else:
                 y, y_var, new_state = scan(v, lambda_v, k, q, lam0, eta0)

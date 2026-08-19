@@ -138,13 +138,13 @@ def kla_scan_triton(
 
     # Precision scan λ_t via the trace-normalized linear-space Möbius recurrence
     # λ_t = (A·λ' + B)/(C·λ' + D), with leaf A=(1+pφ)/a², B=φ, C=p/a², D=1.
-    # Differentiable, and the schedule reaches the forward only: the adjoint
+    # Differentiable, and the implementation reaches the forward only: the adjoint
     # reads the values λ and λ_{t-1}, not the order they were produced in.
     A_lin = ((1.0 + p_ * phi) / a2).expand_as(phi).contiguous()
     C_lin = (p_ / a2).expand_as(phi).contiguous()
-    schedule = unfused[kernel]
+    implementation = unfused[kernel]
     lam = mobius_scan(
-        A_lin, phi.contiguous(), C_lin, torch.ones_like(phi), lam0, schedule
+        A_lin, phi.contiguous(), C_lin, torch.ones_like(phi), lam0, implementation
     )
     var = 1.0 / lam.clamp_min(EPS)
 
@@ -155,7 +155,7 @@ def kla_scan_triton(
 
     # Fold η0 into the first step's input, then scan the affine recurrence (η_{-1}=0).
     r = torch.cat((r[:, :1] + alpha[:, :1] * eta0.unsqueeze(1), r[:, 1:]), dim=1)
-    eta = affine_scan(alpha.contiguous(), r.contiguous(), schedule)
+    eta = affine_scan(alpha.contiguous(), r.contiguous(), implementation)
 
     mean = eta * var
     if decode_from_prior:

@@ -1,4 +1,4 @@
-"""The Metal backward — one exact adjoint for both MPS schedules.
+"""The Metal backward — one exact adjoint for both MPS implementations.
 
 ``mps_recurrent`` and ``mps_chunk`` write the same ``[B, M, NCK, S]``
 checkpoints at the same stride, so they share this. The kernel is lane-per-state

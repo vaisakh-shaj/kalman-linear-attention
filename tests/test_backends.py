@@ -3,7 +3,7 @@
 The backends implement the same math with very different numerics, so each gets
 its own tolerance profile rather than one shared threshold:
 
-Implementations are named ``<backend>[_unfused]_<schedule>`` — see
+Implementations are named ``<backend>[_unfused]_<implementation>`` — see
 ``docs/implementations.md``.
 
 * ``torch_unfused_*`` — the reference. Forward and backward both tight.
@@ -222,7 +222,7 @@ PROFILES = {
         ),
         # Same composition, resolved across chunks by a parallel scan instead of
         # a serial carry -- and the same lane-per-state backward again, reading
-        # checkpoints this schedule produces rather than stores.
+        # checkpoints this implementation produces rather than stores.
         Profile(
             "mps_pscan",
             1e-3,
@@ -874,7 +874,7 @@ def test_mps_threadgroup_geometry(backend, S, M):
 @pytest.mark.parametrize("backend", ["mps_chunk", "mps_pscan"])
 @pytest.mark.parametrize("L", [CHUNK, 100])
 def test_mps_strategies_agree(backend, L):
-    """The three Metal schedules must agree.
+    """The three Metal implementations must agree.
 
     They share no forward kernel -- ``mps_recurrent`` applies the Moebius map
     down B*M*S serial lanes, ``mps_chunk`` composes it with time as a parallel
@@ -1122,6 +1122,27 @@ def test_mps_widens_low_precision_inputs(backend, dtype):
 # Every implementation in the registry is profiled above. Anything added
 # without a profile fails test_every_backend_is_covered, which is the point.
 COVERED_ELSEWHERE: dict[str, str] = {}
+
+
+def test_the_backend_literal_matches_the_registry():
+    """``KLAConfig.backend`` must accept exactly what ``kla_scan`` dispatches.
+
+    The literal is hand-written and the registry is the truth, so they drift the
+    moment a cell is added -- and the failure is silent under a plain dataclass:
+    the config takes the value, the scan runs, and only a type checker or a CLI
+    generator ever notices.
+    """
+    import typing
+
+    from kla.configs import Backend
+    from kla.ops.kla_ops import backend_aliases, backend_names
+
+    literal = set(typing.get_args(Backend)) - {"auto"}
+    registry = set(backend_names()) | set(backend_aliases())
+    assert literal == registry, (
+        f"missing from the literal: {sorted(registry - literal)}; "
+        f"stale in the literal: {sorted(literal - registry)}"
+    )
 
 
 def test_every_backend_is_covered():

@@ -13,14 +13,14 @@
  * flight at once and the depth is log(NCK) instead of NCK -- but the aggregates
  * have to be materialized in global memory ([B,M,NCK,S] of them, two scans'
  * worth), and every element is touched about three times instead of once. This
- * is the schedule for a short-and-wide launch that the other two starve on, not
+ * is the implementation for a short-and-wide launch that the other two starve on, not
  * the one to reach for by default.
  *
  * It stays "fused" in the sense this repo uses the word: the intermediates are
  * per *chunk*, [B,M,NCK,S], never the per-timestep [B,L,M,S] the unfused torch
  * path builds. At KLA_CHUNK = 16 that is a 16x smaller footprint, and the two
  * lambda/eta arrays it does write are the backward's checkpoints -- which this
- * schedule produces for free, since "the state entering chunk c" is exactly
+ * implementation produces for free, since "the state entering chunk c" is exactly
  * what the scan over aggregates computes.
  *
  * Five kernels, two reduce-scan-apply rounds:

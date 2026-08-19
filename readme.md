@@ -42,7 +42,7 @@ machine will use:
 python -m kla --check-backends
 ```
 
-The scan has four backends (torch, triton, cuda, mps) and three schedules each
+The scan has four backends (torch, triton, cuda, mps) and three implementations each
 — see [docs/implementations.md](docs/implementations.md) for the naming and
 [docs/backends.md](docs/backends.md) for what each needs. For the fastest option
 on NVIDIA hardware:
@@ -58,7 +58,7 @@ This repository is split in two parts:
 - (Coming Soon) `experiments/` + `main.py` (with `nanochat/` and `mad/` submodules): Non-package code to reproduce the papers experiments.
 
 The ancillary parts are:
-- `docs/`: General documentation — [usage](docs/usage.md), [backends](docs/backends.md), [implementations](docs/implementations.md).
+- `docs/`: General documentation — [usage](docs/usage.md), [backends](docs/backends.md), [implementations](docs/implementations.md), [benchmarks](docs/benchmarks/).
 - `tests/`: Unit tests for the package.
 
 ### Package

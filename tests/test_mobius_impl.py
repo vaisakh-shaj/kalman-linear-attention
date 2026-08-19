@@ -59,7 +59,10 @@ def _rel(x, y):
 
 
 @pytest.mark.parametrize(
-    "scan_impl", ["associative", "doubling", "chunk", "sequential"]
+    # No "sequential": that implementation applies the map instead of composing it,
+    # so there is no representation for mobius_impl to choose between.
+    "scan_impl",
+    ["associative", "doubling", "chunk"],
 )
 def test_linear_matches_log_forward(scan_impl):
     """Same map, two representations -- across every way of parallelizing the scan.

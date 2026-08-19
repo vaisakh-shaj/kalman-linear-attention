@@ -8,7 +8,7 @@ with ``[B, M, NCK, S]`` of aggregates in device memory and roughly three touches
 of each element instead of one.
 
 Two of those aggregate arrays are the backward's checkpoints, which this
-schedule computes rather than stores: "the state entering chunk c" is precisely
+implementation computes rather than stores: "the state entering chunk c" is precisely
 what the scan produces. So :func:`~kla.ops.kernels.mps.kla_scan_bwd.scan_backward`
 runs behind this forward with no changes at all — same layout, same stride, same
 convention — and the gradients are the same exact ones.

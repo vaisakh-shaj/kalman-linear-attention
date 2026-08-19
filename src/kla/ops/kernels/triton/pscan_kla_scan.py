@@ -8,14 +8,14 @@ and the cross-chunk dependency is settled by a parallel scan over the ``NCK``
 aggregates rather than by anyone waiting for their neighbour.
 
 The grid is ``B*M*NCK`` rather than ``B*M``, which is the point: at batch-1
-prefill the other two schedules leave the GPU with ``B*M`` programs and nothing
+prefill the other two implementations leave the GPU with ``B*M`` programs and nothing
 to overlap. The trade is ``[B, M, NCK, S]`` of aggregates in HBM and roughly
 three touches of each element instead of one.
 
 It stays fused in the sense this repo uses the word — the intermediates are per
 *chunk*, never the per-timestep ``[B, L, M, S]`` the unfused path builds — and
 two of those aggregate arrays are the backward's checkpoints, which this
-schedule computes rather than stores: "the state entering chunk c" is exactly
+implementation computes rather than stores: "the state entering chunk c" is exactly
 what the scan over aggregates produces. So
 :mod:`kla.ops.kernels.triton.kla_scan_bwd` runs behind it unchanged, at the
 same stride, for the same exact gradients.

@@ -1,4 +1,4 @@
-"""The triton backward — one adjoint for every fused triton schedule.
+"""The triton backward — one adjoint for every fused triton implementation.
 
 An adjoint does not have to mirror its forward. All this kernel needs is
 ``(lambda, eta)`` at the chunk boundaries; how the forward got there — walking

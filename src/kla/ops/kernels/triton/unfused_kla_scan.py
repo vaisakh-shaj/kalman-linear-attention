@@ -1,4 +1,4 @@
-"""The scans behind the unfused triton cells — λ and η, three schedules each.
+"""The scans behind the unfused triton cells — λ and η, three implementations each.
 
 "Unfused" here means the kernels consume already-built per-``(b,l,m,s)`` leaf
 coefficients and write per-``(b,l,m,s)`` results, with the sufficient statistics
@@ -6,7 +6,7 @@ and the read-out done in torch around them. That costs several HBM passes the
 fused cells avoid, and buys a scan that is coefficient-agnostic: nothing here
 depends on how ``a``/``p`` were discretized.
 
-Two ideas are common to every schedule, and shared with the other backends:
+Two ideas are common to every implementation, and shared with the other backends:
 
 1. **Linear-space, trace-normalized** 2×2 matmul instead of a log-space
    ``logaddexp`` combine. The Möbius map ``λ ↦ (Aλ+B)/(Cλ+D)`` is stored as the
@@ -18,7 +18,7 @@ Two ideas are common to every schedule, and shared with the other backends:
 2. **All ``S`` states in parallel**, as a tile axis, on a grid over
    ``(batch, channel)`` — rather than one tiny program per ``(b, m, s)``.
 
-The three schedules differ only in how time is walked (see
+The three implementations differ only in how time is walked (see
 ``docs/implementations.md``):
 
 ``recurrent``
@@ -34,10 +34,10 @@ The three schedules differ only in how time is walked (see
     chunk is reduced on its own and the chunks are resolved by a parallel scan
     over their aggregates, ping-ponged across launches.
 
-There is **one backward, not one per schedule** — see :class:`MobiusScan`. Both
+There is **one backward, not one per implementation** — see :class:`MobiusScan`. Both
 recurrences have a scalar adjoint that depends on the *values* λ and η, not on
 the order they were produced in, so the reverse scan is the same work whichever
-forward ran. It uses the chunk schedule throughout.
+forward ran. It uses the chunk implementation throughout.
 """
 
 from __future__ import annotations
@@ -136,7 +136,7 @@ def _mobius_lambda_chunk(
     lam0: torch.Tensor | None = None,  # [B, M, S] initial precision (default 1)
     block_l: int = 128,
 ) -> torch.Tensor:
-    """λ_t [B, L, M, S], chunk-scheduled: scan a tile, carry the matrix."""
+    """λ_t [B, L, M, S], chunk-implementationd: scan a tile, carry the matrix."""
     Bd, L, Mc, S = A.shape
 
     def to_bmls(x):
@@ -225,7 +225,7 @@ def _affine_eta_chunk(
     r: torch.Tensor,  # [B, L, M, S] input r_t (η0 already folded into t=0)
     block_l: int = 128,
 ) -> torch.Tensor:
-    """η_t [B, L, M, S], chunk-scheduled: scan a tile, carry the map."""
+    """η_t [B, L, M, S], chunk-implementationd: scan a tile, carry the map."""
     Bd, L, Mc, S = alpha.shape
 
     def to_bmls(x):
@@ -515,10 +515,10 @@ def _doubling(kernel, bufs, alts, grid, M, S, n_ck, block_s, num_warps):
 
 
 # ---------------------------------------------------------------------------
-# The two public forwards: pick a schedule, get the same lambda / eta.
+# The two public forwards: pick a implementation, get the same lambda / eta.
 # ---------------------------------------------------------------------------
 
-SCHEDULES = ("recurrent", "chunk", "pscan")
+IMPLEMENTATIONS = ("recurrent", "chunk", "pscan")
 
 
 def _geometry(shape, block_l):
@@ -526,12 +526,15 @@ def _geometry(shape, block_l):
     return Bd, L, Mc, S, triton.cdiv(L, block_l), triton.next_power_of_2(S)
 
 
-def mobius_lambda(A, B, C, D, lam0=None, schedule="chunk", block_l: int = 128):
-    """λ_t [B, L, M, S] from the leaf coefficients, on the named schedule."""
-    if schedule == "chunk":
+def mobius_lambda(A, B, C, D, lam0=None, implementation="chunk", block_l: int = 128):
+    """λ_t [B, L, M, S] from the leaf coefficients, on the named implementation."""
+    if implementation == "chunk":
         return _mobius_lambda_chunk(A, B, C, D, lam0, block_l)
-    if schedule not in SCHEDULES:
-        raise ValueError(f"Unknown schedule {schedule!r}; expected one of {SCHEDULES}")
+    if implementation not in IMPLEMENTATIONS:
+        raise ValueError(
+            f"Unknown implementation {implementation!r}; "
+            f"expected one of {IMPLEMENTATIONS}"
+        )
 
     Bd, L, Mc, S, n_ck, block_s = _geometry(A.shape, block_l)
     num_warps = 2 if block_l <= 128 else 4
@@ -545,7 +548,7 @@ def mobius_lambda(A, B, C, D, lam0=None, schedule="chunk", block_l: int = 128):
     lam0 = lam0.contiguous()
     out = torch.empty_like(Ai)
 
-    if schedule == "recurrent":
+    if implementation == "recurrent":
         _recurrent_mobius_fwd_kernel[(Bd * Mc,)](
             Ai,
             Bi,
@@ -604,12 +607,15 @@ def mobius_lambda(A, B, C, D, lam0=None, schedule="chunk", block_l: int = 128):
     return out.permute(0, 2, 1, 3).contiguous()
 
 
-def affine_eta(alpha, r, schedule="chunk", block_l: int = 128):
-    """η_t [B, L, M, S] = α_t·η_{t-1} + r_t, on the named schedule."""
-    if schedule == "chunk":
+def affine_eta(alpha, r, implementation="chunk", block_l: int = 128):
+    """η_t [B, L, M, S] = α_t·η_{t-1} + r_t, on the named implementation."""
+    if implementation == "chunk":
         return _affine_eta_chunk(alpha, r, block_l)
-    if schedule not in SCHEDULES:
-        raise ValueError(f"Unknown schedule {schedule!r}; expected one of {SCHEDULES}")
+    if implementation not in IMPLEMENTATIONS:
+        raise ValueError(
+            f"Unknown implementation {implementation!r}; "
+            f"expected one of {IMPLEMENTATIONS}"
+        )
 
     Bd, L, Mc, S, n_ck, block_s = _geometry(alpha.shape, block_l)
     num_warps = 2 if block_l <= 128 else 4
@@ -620,7 +626,7 @@ def affine_eta(alpha, r, schedule="chunk", block_l: int = 128):
     ai, ri = to_bmls(alpha), to_bmls(r)
     out = torch.empty_like(ai)
 
-    if schedule == "recurrent":
+    if implementation == "recurrent":
         _recurrent_affine_fwd_kernel[(Bd * Mc,)](
             ai, ri, out, Mc, L, S, BLOCK_S=block_s, num_warps=num_warps
         )
@@ -689,12 +695,12 @@ class MobiusScan(torch.autograd.Function):
     """λ_t = (A_t·λ_{t-1} + B_t)/(C_t·λ_{t-1} + D_t): any forward, one backward.
 
     The adjoint reads the *values* λ and λ_{t-1}, not the order they were
-    produced in, so ``schedule`` reaches the forward and stops there.
+    produced in, so ``implementation`` reaches the forward and stops there.
     """
 
     @staticmethod
-    def forward(ctx, A, B, C, D, lam0, schedule):
-        lam = mobius_lambda(A, B, C, D, lam0, schedule)
+    def forward(ctx, A, B, C, D, lam0, implementation):
+        lam = mobius_lambda(A, B, C, D, lam0, implementation)
         ctx.save_for_backward(A, B, C, D, lam0, lam)
         return lam
 
@@ -718,8 +724,8 @@ class AffineScan(torch.autograd.Function):
     """η_t = α_t·η_{t-1} + r_t (η_{-1}=0): any forward, one backward."""
 
     @staticmethod
-    def forward(ctx, alpha, r, schedule):
-        eta = affine_eta(alpha, r, schedule)
+    def forward(ctx, alpha, r, implementation):
+        eta = affine_eta(alpha, r, implementation)
         ctx.save_for_backward(alpha, eta)
         return eta
 
@@ -733,14 +739,14 @@ class AffineScan(torch.autograd.Function):
         return d_alpha, d_r, None
 
 
-def mobius_scan(A, B, C, D, lam0=None, schedule="chunk"):
+def mobius_scan(A, B, C, D, lam0=None, implementation="chunk"):
     """Differentiable Möbius scan → λ_t [B, L, M, S]."""
     if lam0 is None:
         Bd, _, Mc, S = A.shape
         lam0 = torch.ones(Bd, Mc, S, device=A.device, dtype=torch.float32)
-    return MobiusScan.apply(A, B, C, D, lam0, schedule)
+    return MobiusScan.apply(A, B, C, D, lam0, implementation)
 
 
-def affine_scan(alpha, r, schedule="chunk"):
+def affine_scan(alpha, r, implementation="chunk"):
     """Differentiable affine scan → η_t [B, L, M, S]."""
-    return AffineScan.apply(alpha, r, schedule)
+    return AffineScan.apply(alpha, r, implementation)

@@ -1,7 +1,7 @@
 """Generic associative-scan utilities for the pure-torch backend.
 
-Four interchangeable implementations of an inclusive scan over tuples of
-tensors, one per *schedule* (see ``docs/implementations.md``):
+Three interchangeable implementations of an inclusive scan over tuples of
+tensors (see ``docs/implementations.md`` for the implementations they name):
 
 - ``associative``: ``torch._higher_order_ops.associative_scan`` (PyTorch 2.8+).
   A pscan — the whole sequence at once, no serial carry.
@@ -11,8 +11,12 @@ tensors, one per *schedule* (see ``docs/implementations.md``):
 - ``chunk``: doubling inside a chunk, a serial carry across chunks. O(L) work
   and O(L/C) serial steps, so it is the middle ground between the two above and
   ``sequential``.
-- ``sequential``: python loop. The recurrent schedule — a correctness reference,
-  and what short sequences and decode want.
+There is no ``sequential`` entry here, and that is the point: a serial walk does
+not need an associative combine at all — it can *apply* the update to a running
+value instead of composing two of them. That is
+:func:`kla.ops.kla_ops._recurrent_lambda_eta`, built on
+``torch._higher_order_ops.scan``, and it lives next to the recurrence it applies
+because it is specific to it.
 
 All combine functions take ``(left, right)`` tuples where ``left`` is the
 earlier prefix, and return the composed element.
@@ -84,20 +88,6 @@ def chunk_scan(
     return tuple(torch.cat([b[i] for b in blocks], dim=dim) for i in range(len(xs)))
 
 
-def sequential_scan(
-    combine_fn: CombineFn, xs: Sequence[torch.Tensor], dim: int
-) -> tuple[torch.Tensor, ...]:
-    """Inclusive scan via a python loop (reference implementation)."""
-    length = xs[0].size(dim)
-    state = tuple(t.select(dim, 0) for t in xs)
-    outs = [state]
-    for t in range(1, length):
-        step = tuple(x.select(dim, t) for x in xs)
-        state = combine_fn(state, step)
-        outs.append(state)
-    return tuple(torch.stack([o[i] for o in outs], dim=dim) for i in range(len(xs)))
-
-
 @functools.cache
 def _associative_scan_available() -> bool:
     try:
@@ -133,6 +123,4 @@ def resolve_scan(
         return doubling_scan
     if scan_impl == "chunk":
         return chunk_scan
-    if scan_impl == "sequential":
-        return sequential_scan
     raise ValueError(f"Unknown scan_impl: {scan_impl!r}")
