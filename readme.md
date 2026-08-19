@@ -33,13 +33,15 @@ git clone https://github.com/vaisakh-shaj/kalman-linear-attention.git kla
 uv pip install ./kla
 ```
 
-Runs on CPU and NVIDIA GPUs out of the box. To see what this machine will use:
+Runs on CPU, NVIDIA GPUs and Apple silicon out of the box. To see what this
+machine will use:
 
 ```bash
 python -m kla --check-backends
 ```
 
-Faster GPU kernels are optional extras — see [docs/backends.md](docs/backends.md):
+For more details and other faster options see
+[docs/backends.md](docs/backends.md):
 
 ```bash
 uv pip install "kla[triton]"

@@ -1,6 +1,7 @@
 from kla.ops.kla_ops import (
     KLAState,
     backend_names,
+    default_device,
     init_state,
     kla_scan,
     kla_scan_reference,
@@ -12,6 +13,7 @@ from kla.ops.kla_ops import (
 __all__ = [
     "KLAState",
     "backend_names",
+    "default_device",
     "init_state",
     "kla_scan",
     "kla_scan_reference",

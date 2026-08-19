@@ -36,6 +36,9 @@ B, L, M, S = 1, 8, 3, 2
 
 
 def _inputs(device, seq=True, seed=0):
+    if device == "mps":
+        # Kernel backends are anchored by gradient parity in test_backends.py.
+        pytest.skip("gradcheck needs float64; MPS is float32-only")
     g = torch.Generator(device="cpu").manual_seed(seed)
     kw = dict(dtype=torch.float64, device=device)
 

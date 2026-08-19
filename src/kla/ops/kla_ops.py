@@ -367,15 +367,31 @@ def _backend_torch(*args, scan_impl="auto", mobius_impl="linear", **kwargs):
 
 
 def _backend_triton(*args, **kwargs):
+    """Fused forward when nothing needs an adjoint, tiled scans otherwise."""
     from kla.ops.triton_backend import kla_scan_triton
 
     return kla_scan_triton(*args, **kwargs)
 
 
-def _backend_cuda(*args, **kwargs):
+def _backend_triton_fused(*args, **kwargs):
+    """Pin the fused triton forward — see :mod:`kla.ops.triton_backend`."""
+    from kla.ops.triton_backend import kla_scan_triton
+
+    return kla_scan_triton(*args, kernel="fused", **kwargs)
+
+
+def _backend_triton_composed(*args, **kwargs):
+    """Pin the tiled triton fwd+bwd scans — see :mod:`kla.ops.triton_backend`."""
+    from kla.ops.triton_backend import kla_scan_triton
+
+    return kla_scan_triton(*args, kernel="composed", **kwargs)
+
+
+def _backend_cuda_v2_2(*args, **kwargs):
+    """The corrected kernel, named — see :mod:`kla.ops.cuda_backend`."""
     from kla.ops.cuda_backend import kla_scan_cuda
 
-    return kla_scan_cuda(*args, **kwargs)
+    return kla_scan_cuda(*args, kernel_version="v2_2", **kwargs)
 
 
 def _backend_cuda_v2_1(*args, **kwargs):
@@ -385,11 +401,44 @@ def _backend_cuda_v2_1(*args, **kwargs):
     return kla_scan_cuda(*args, kernel_version="v2_1", **kwargs)
 
 
+def _backend_mps_fused(*args, **kwargs):
+    """One fused Metal kernel per pass — see :mod:`kla.ops.mps_backend`."""
+    from kla.ops.mps_backend import kla_scan_mps_fused
+
+    return kla_scan_mps_fused(*args, **kwargs)
+
+
+def _backend_mps_tiled(*args, **kwargs):
+    """Time-parallel Metal forward — see :mod:`kla.ops.mps_backend`."""
+    from kla.ops.mps_backend import kla_scan_mps_tiled
+
+    return kla_scan_mps_tiled(*args, **kwargs)
+
+
+def _backend_mps_composed(*args, **kwargs):
+    """Composed Metal scans + torch glue — see :mod:`kla.ops.mps_backend`."""
+    from kla.ops.mps_backend import kla_scan_mps_composed
+
+    return kla_scan_mps_composed(*args, **kwargs)
+
+
+# One family per device, named after it, plus every implementation behind that
+# family under a "<family>_<impl>" name. The bare name is the family's default
+# implementation, so a config can either say "the good one for this device" or
+# pin an exact kernel; "auto" is the only value whose meaning depends on the
+# machine.
 _BACKENDS = {
     "torch": _backend_torch,
     "triton": _backend_triton,
-    "cuda": _backend_cuda,  # v2_2, the corrected kernel
+    "triton_fused": _backend_triton_fused,
+    "triton_composed": _backend_triton_composed,
+    "cuda": _backend_cuda_v2_2,  # the corrected kernel
+    "cuda_v2_2": _backend_cuda_v2_2,
     "cuda_v2_1": _backend_cuda_v2_1,
+    "mps": _backend_mps_fused,
+    "mps_fused": _backend_mps_fused,
+    "mps_tiled": _backend_mps_tiled,
+    "mps_composed": _backend_mps_composed,
 }
 
 
@@ -402,11 +451,35 @@ def _triton_available() -> bool:
     return True
 
 
+@functools.cache
+def _mps_available() -> bool:
+    try:
+        from kla.ops.kernels.mps import is_available
+    except Exception:
+        return False
+    return is_available()
+
+
+# Device -> the backend "auto" picks there, if its kernels are importable. The
+# `cuda` kernels are deliberately absent: their backward is an approximate
+# adjoint, so they stay opt-in.
+_AUTO = (
+    ("is_cuda", "triton", _triton_available),
+    ("is_mps", "mps", _mps_available),
+)
+
+
 def _resolve_auto(x: torch.Tensor) -> str:
-    """Pick the fastest backend that handles the full flag space on this device:
-    the triton scans on a CUDA device with triton installed, else torch."""
-    if x.is_cuda and _triton_available():
-        return "triton"
+    """The backend ``"auto"`` picks for tensors on ``x``'s device.
+
+    Device in, backend out — nothing about the *call* is consulted. A backend
+    that cannot serve a particular request raises and names one that can, rather
+    than being swapped out underneath you, so the kernels a run used are a
+    function of the config and the machine and nothing else.
+    """
+    for attr, backend, available in _AUTO:
+        if getattr(x, attr) and available():
+            return backend
     return "torch"
 
 
@@ -429,9 +502,9 @@ def kla_scan(
     Inputs in paper notation: value ``v``, value precision ``lambda_v`` (Λ^v),
     key ``k``, query ``q``, discrete decay ``a``, process noise ``p``.
 
-    "auto" prefers the triton scans on a CUDA device (the fused forward for
-    inference, the tiled fwd+bwd otherwise) and falls back to the pure-torch
-    parallel scan on CPU or when triton is unavailable.
+    "auto" is the only value that is not a fixed implementation: it reads the
+    device and nothing else (see :func:`_resolve_auto`). Every other name runs
+    exactly the kernels it says, so pass one to pin the code path.
     """
     if backend == "auto":
         backend = _resolve_auto(v)
@@ -477,8 +550,17 @@ def backend_names() -> tuple:
     return tuple(_BACKENDS)
 
 
+def default_device() -> str:
+    """The accelerator ``python -m kla`` and ``resolve_backend`` assume."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def resolve_backend(device=None) -> str:
     """The backend ``backend="auto"`` resolves to for tensors on ``device``."""
     if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = default_device()
     return _resolve_auto(torch.empty(0, device=device))

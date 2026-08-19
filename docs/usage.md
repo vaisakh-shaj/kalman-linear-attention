@@ -34,7 +34,7 @@ KLAConfig(d_state=16)  # and d_model, which you pass to the layer
 `d_state` is the one specific to KLA: how much the filter remembers. Memory and
 compute scale linearly in it, and 16 is a good default. Below 8 the filter starts
 to degenerate; above 64 you rarely gain. (64 is also the ceiling for the CUDA
-backend.)
+backend, and 128 for the fused MPS one.)
 
 Everything else has a sensible default.
 

@@ -7,6 +7,8 @@ def pytest_generate_tests(metafunc):
         devices = ["cpu"]
         if torch.cuda.is_available():
             devices.append("cuda")
+        if torch.backends.mps.is_available():
+            devices.append("mps")
         metafunc.parametrize("device", devices)
 
 

@@ -7,39 +7,52 @@
 
 ``--check-backends`` is a cheap capability probe: it looks for the device, the
 package and ``nvcc``, and imports the backend, but compiles nothing - so ``[x]``
-on a CUDA backend does not mean "the kernel builds". ``[X]`` marks the one
-``auto`` resolves to here. ``--test-backends`` is the authoritative
-answer - per backend it runs the forward and the backward and reports each
+on a kernel backend does not mean "the kernel builds". ``[X]`` marks the one
+``auto`` resolves to here. ``--test-backends`` is the authoritative answer - it
+runs the forward and the backward of every implementation named and reports each
 against :func:`kla.ops.kla_scan_reference`.
 
 Naming backends asserts they work: ``--test-backends triton`` exits non-zero if
 triton is unusable here, so it is a CI smoke test. ``all`` is a survey and
 always exits 0 - on a CPU-only box the GPU ones are expected to fail.
+
+``--test-backends`` takes either a family (``mps``, which runs every Metal
+implementation) or one exact backend (``mps_fused``), so a single implementation
+can be pinned and checked on its own.
 """
 
 from __future__ import annotations
 
 import tyro
 
-# Prose keyed by CLI-facing backend name (see _groups). A backend added to the
+# Prose keyed by backend family (see _families). A family added to the
 # dispatcher still lists; it just gets no description.
 _DESCRIPTIONS = {
     "torch": "the portable reference implementation",
     "triton": "fused triton kernels",
     "cuda": "JIT-compiled CUDA kernel; forward/training only",
+    "mps": "Metal kernels; no toolchain needed",
+}
+
+# Module that must import for a backend family to be usable at all.
+_MODULES = {
+    "triton": "kla.ops.triton_backend",
+    "cuda": "kla.ops.cuda_backend",
+    "mps": "kla.ops.mps_backend",
 }
 
 
-def _groups(names: tuple[str, ...]) -> dict[str, list[str]]:
-    """CLI-facing backends, mapped to the dispatcher names behind each.
+def _families(names: tuple[str, ...]) -> dict[str, list[str]]:
+    """Backend families, mapped to the implementations behind each.
 
-    There is one ``cuda`` backend. The dispatcher carries pinned kernel variants
-    under ``cuda*`` names for reproducing old runs; they compile from the same
-    toolchain and are folded into the single ``cuda`` entry here.
+    A family is everything sharing a ``<family>_<impl>`` prefix, because what a
+    reader wants from ``--check-backends`` is "can this machine run Metal / CUDA
+    kernels", which is one answer per device. ``--test-backends`` still accepts
+    the exact names (see :func:`main`).
     """
     grouped: dict[str, list[str]] = {}
     for name in names:
-        grouped.setdefault("cuda" if name.startswith("cuda") else name, []).append(name)
+        grouped.setdefault(name.split("_", 1)[0], []).append(name)
     return grouped
 
 
@@ -80,7 +93,7 @@ def _import_error(backend: str) -> str:
     """
     import importlib
 
-    module = "kla.ops.triton_backend" if backend == "triton" else "kla.ops.cuda_backend"
+    module = _MODULES[backend]
     try:
         importlib.import_module(module)
     except Exception as exc:
@@ -88,31 +101,58 @@ def _import_error(backend: str) -> str:
     return ""
 
 
-def _probe(backend: str, cuda: bool, triton: bool) -> tuple[bool, str]:
-    """Can ``backend`` plausibly run here? Cheap; no compute, no compilation.
+def _requirements() -> dict[str, list[tuple[bool, str]]]:
+    """What each family needs before it can run: ``(holds, what is missing)``.
+
+    One row per family rather than a branch per device, so a new backend is a
+    new row. Every check here is cheap - a device query, a spec lookup, a
+    ``which`` - and nothing compiles.
+    """
+    from importlib.util import find_spec
+
+    import torch
+
+    cuda = (torch.cuda.is_available(), "needs a CUDA device")
+    return {
+        "torch": [],
+        "triton": [
+            cuda,
+            (
+                find_spec("triton") is not None,
+                "needs the triton package: pip install 'kla[triton]'",
+            ),
+        ],
+        "cuda": [
+            cuda,
+            (
+                _nvcc() is not None,
+                "needs nvcc to build; not on PATH or under CUDA_HOME",
+            ),
+        ],
+        "mps": [(torch.backends.mps.is_available(), "needs an Apple-silicon GPU")],
+    }
+
+
+def _probe(family: str, requirements: list[tuple[bool, str]]) -> tuple[bool, str]:
+    """Can ``family`` plausibly run here? Cheap; no compute, no compilation.
 
     Returns ``(usable, why)``. ``why`` always says what the backend *is*, so an
     unusable one still describes itself, and appends what is missing - including
     the case where the requirements are met but the backend itself is broken.
     """
-    described = _DESCRIPTIONS.get(backend, "")
+    described = _DESCRIPTIONS.get(family, "")
 
     def no(reason: str) -> tuple[bool, str]:
         return False, f"{described} - {reason}" if described else reason
 
-    if backend == "torch":
+    for holds, missing in requirements:
+        if not holds:
+            return no(missing)
+    if family not in _MODULES:  # torch: nothing to import, nothing to build
         return True, described
-    if not cuda:
-        return no("needs a CUDA device")
-    if backend == "triton" and not triton:
-        return no("needs the triton package: pip install 'kla[triton]'")
-    if broken := _import_error(backend):
+    if broken := _import_error(family):
         return no(f"installed, but fails to import - {broken}")
-    if backend.startswith("cuda"):
-        if _nvcc() is None:
-            return no("needs nvcc to build; not on PATH or under CUDA_HOME")
-        return True, f"{described} (compiled on first use)"
-    return True, described
+    return True, f"{described} (compiled on first use)"
 
 
 def _inputs(device: str, requires_grad: bool = False):
@@ -156,12 +196,8 @@ def _oneline(exc: Exception) -> str:
     return f"{type(exc).__name__}: {line[0]}" if line else type(exc).__name__
 
 
-def _forward(backend: str, device: str) -> tuple[str, str, float]:
-    """Forward parity against the reference. Returns (status, detail, severity).
-
-    ``severity`` is the deviation as a fraction of its budget, so results from
-    different kernels are comparable when a grouped entry picks one to report.
-    """
+def _forward(backend: str, device: str) -> tuple[str, str]:
+    """Forward parity against the reference. Returns ``(status, detail)``."""
     import torch
 
     from kla.ops import kla_scan, kla_scan_reference
@@ -170,12 +206,12 @@ def _forward(backend: str, device: str) -> tuple[str, str, float]:
     try:
         y, y_var, _ = kla_scan(*args, backend=backend)
     except NotImplementedError as exc:
-        return "skipped", _oneline(exc), 0.0
+        return "skipped", _oneline(exc)
     except Exception as exc:
-        return "FAILED", _oneline(exc), float("inf")
+        return "FAILED", _oneline(exc)
 
     if not (torch.isfinite(y).all() and torch.isfinite(y_var).all()):
-        return "FAILED", "produced non-finite output", float("inf")
+        return "FAILED", "produced non-finite output"
 
     y_ref, y_var_ref, _ = kla_scan_reference(*args)
     dy = (y - y_ref).abs().max().item()
@@ -184,14 +220,11 @@ def _forward(backend: str, device: str) -> tuple[str, str, float]:
     matches = torch.allclose(y, y_ref, atol=_ATOL, rtol=_RTOL) and torch.allclose(
         y_var, y_var_ref, atol=_ATOL, rtol=_RTOL
     )
-    return ("ok" if matches else "FAILED"), detail, max(dy, dvar) / _ATOL
+    return ("ok" if matches else "FAILED"), detail
 
 
-def _gradients(backend: str, device: str) -> tuple[str, str, float]:
-    """Per-input gradient parity against the reference.
-
-    Returns ``(status, detail, severity)``; see :func:`_forward`.
-    """
+def _gradients(backend: str, device: str) -> tuple[str, str]:
+    """Per-input gradient parity against the reference. ``(status, detail)``."""
     import torch
 
     from kla.ops import kla_scan, kla_scan_reference
@@ -204,9 +237,9 @@ def _gradients(backend: str, device: str) -> tuple[str, str, float]:
         # precision path in it. Both are needed to give every input a gradient.
         (y.square().sum() + y_var.sum()).backward()
     except NotImplementedError as exc:
-        return "skipped", _oneline(exc), 0.0
+        return "skipped", _oneline(exc)
     except Exception as exc:
-        return "FAILED", _oneline(exc), float("inf")
+        return "FAILED", _oneline(exc)
 
     y_ref, y_var_ref, _ = kla_scan_reference(*refs)
     (y_ref.square().sum() + y_var_ref.sum()).backward()
@@ -215,9 +248,9 @@ def _gradients(backend: str, device: str) -> tuple[str, str, float]:
     worst_name, worst_ratio, worst_err = "", 0.0, 0.0
     for name, got, ref in zip(_INPUT_NAMES, args, refs):
         if got.grad is None:
-            return "FAILED", f"no gradient reached d{name}", float("inf")
+            return "FAILED", f"no gradient reached d{name}"
         if not torch.isfinite(got.grad).all():
-            return "FAILED", f"non-finite d{name}", float("inf")
+            return "FAILED", f"non-finite d{name}"
         err = _rel_err(got.grad, ref.grad)
         budget = _LOOSE_GRAD_TOL if name in loose else _GRAD_TOL
         if err / budget > worst_ratio:
@@ -227,37 +260,29 @@ def _gradients(backend: str, device: str) -> tuple[str, str, float]:
     detail = f"worst d{worst_name} {worst_err:.1e}   (budget {budget:g})"
     if loose:
         detail += f"   [d{', d'.join(loose)} approximate by design]"
-    return ("ok" if worst_ratio < 1.0 else "FAILED"), detail, worst_ratio
+    return ("ok" if worst_ratio < 1.0 else "FAILED"), detail
 
 
-# Worst-first, so a group reports its most serious kernel result.
-_RANK = {"FAILED": 0, "skipped": 1, "ok": 2}
+_CHECKS = (("forward", _forward), ("gradients", _gradients))
 
 
-def _test(group: str, members: list[str]) -> tuple[bool, list[tuple[str, str, str]]]:
-    """Run forward and gradient checks for one CLI entry.
+def _test(backend: str, device: str, indent: str) -> bool:
+    """Run every check for one implementation, printing a row each.
 
-    Returns ``(ok, rows)`` with ``rows`` as ``(label, status, detail)`` - one row
-    per check, not per kernel, so a grouped entry stays one report. It passes
-    only if every kernel behind it passes, and the detail names the kernel
-    responsible whenever the group holds more than one. Set
-    ``KLA_JIT_VERBOSE=1`` for the CUDA backend's full build log.
+    Returns whether all of them passed. Set ``KLA_JIT_VERBOSE=1`` for the CUDA
+    backend's full build log.
     """
-    import torch
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    rows, ok = [], True
-    for label, run in (("forward", _forward), ("gradients", _gradients)):
-        results = [(name, *run(name, device)) for name in members]
-        name, status, detail, _ = min(results, key=lambda r: (_RANK[r[1]], -r[3]))
-        ok &= all(r[1] == "ok" for r in results)
-        if len(members) > 1 and status != "skipped":
-            detail = f"{name}: {detail}"
-        # The skip reason is the dispatcher's, identical for every check here.
-        if rows and (status, detail) == (rows[-1][1], rows[-1][2]):
+    ok, last = True, None
+    for label, run in _CHECKS:
+        status, detail = run(backend, device)
+        ok &= status == "ok"
+        # A skip reason is the dispatcher's, so it repeats across every check.
+        if (status, detail) == last:
             detail = "(same reason)"
-        rows.append((label, status, detail))
-    return ok, rows
+        else:
+            last = (status, detail)
+        print(f"{indent}{label:<9}  {status:<7}  {detail}")
+    return ok
 
 
 def main(
@@ -269,54 +294,63 @@ def main(
     Args:
         check_backends: Show every backend and whether it is usable here,
             without running it.
-        test_backends: Run the named backends against the reference. Pass 'all'
-            for every backend.
+        test_backends: Run the named backends against the reference. Takes a
+            family ('mps'), an exact backend ('mps_fused'), or 'all'.
     """
-    from importlib.util import find_spec
-
     import torch
 
     import kla
+    from kla.ops import default_device
 
-    groups = _groups(kla.backend_names())
-    width = max(len(name) for name in groups)
+    families = _families(kla.backend_names())
+    width = max(len(name) for name in families)
 
     if check_backends:
-        cuda = torch.cuda.is_available()
-        triton = find_spec("triton") is not None
-        resolved = kla.resolve_backend()
-        auto = "cuda" if resolved.startswith("cuda") else resolved
-        for name in groups:
-            ok, why = _probe(name, cuda, triton)
+        requirements = _requirements()
+        auto = kla.resolve_backend()
+        for name in families:
+            ok, why = _probe(name, requirements[name])
             mark = "X" if name == auto else "x" if ok else " "
             print(f"  [{mark}] {name:<{width}}  {why}")
         print("\n  [X] = what backend='auto' resolves to here")
         return 0
 
     if test_backends is not None:
+        # A family runs every implementation behind it; an exact name runs just
+        # that one, so a single kernel can be pinned and asserted. Family names
+        # last: a family is also a dispatcher name, and naming it means the set.
+        targets = {name: [name] for name in kla.backend_names()} | dict(families)
         if not test_backends:
             raise SystemExit(
-                f"--test-backends needs 'all', or one of {', '.join(groups)}"
+                f"--test-backends needs 'all', or one of {', '.join(targets)}"
             )
         survey = "all" in test_backends
-        selected = list(groups) if survey else list(test_backends)
-        unknown = [name for name in selected if name not in groups]
+        selected = list(families) if survey else list(test_backends)
+        unknown = [name for name in selected if name not in targets]
         if unknown:
             raise SystemExit(
                 f"unknown backend(s) {', '.join(unknown)}; "
-                f"expected 'all' or {', '.join(groups)}"
+                f"expected 'all' or {', '.join(targets)}"
             )
+        device = default_device()
         failed = 0
         for name in selected:
-            ok, rows = _test(name, groups[name])
-            failed += not ok
-            label_width = max(len(row[0]) for row in rows)
             print(f"\n{name}")
-            for label, status, detail in rows:
-                print(f"  {label:<{label_width}}  {status:<7}  {detail}")
+            impls = targets[name]
+            # Name each implementation only when the entry holds more than one;
+            # otherwise the header above already said which kernel is running.
+            nested = len(impls) > 1
+            ok = True
+            for impl in impls:
+                if nested:
+                    print(f"  {impl}")
+                ok &= _test(impl, device, "    " if nested else "  ")
+            failed += not ok
         return 1 if failed and not survey else 0
 
-    device = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+    device = kla.ops.default_device()
+    if device == "cuda":
+        device = torch.cuda.get_device_name(0)
     print(f"kla {kla.__version__}   torch {torch.__version__}   device: {device}")
     print(f"backend='auto' resolves to: {kla.resolve_backend()}")
     print("\n  --check-backends to see them all, --test-backends to run them")

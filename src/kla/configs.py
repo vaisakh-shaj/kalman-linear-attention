@@ -10,7 +10,23 @@ from __future__ import annotations
 import dataclasses
 from typing import Literal, Optional, Union
 
-Backend = Literal["auto", "torch", "triton", "cuda", "cuda_v2_1"]
+# Every value except "auto" names one implementation and runs exactly it. Where
+# a device has more than one, the bare device name is the sensible default over
+# them and the rest pin a specific kernel -- see KLAConfig.backend.
+Backend = Literal[
+    "auto",
+    "torch",
+    "triton",
+    "triton_fused",
+    "triton_composed",
+    "cuda",
+    "cuda_v2_2",
+    "cuda_v2_1",
+    "mps",
+    "mps_fused",
+    "mps_tiled",
+    "mps_composed",
+]
 ScanImpl = Literal["auto", "associative", "doubling", "sequential"]
 MobiusImpl = Literal["linear", "log"]
 
@@ -165,9 +181,15 @@ class KLAConfig:
 
     # --- hardware / speed tricks -------------------------------------------
     backend: Backend = "auto"
-    """Kernel backend for the core scan. "auto" resolves to triton on a CUDA
-    device with triton importable and to the pure-torch scan otherwise; it never
-    selects a CUDA kernel, which stays opt-in. See :func:`kla.ops.kla_scan`."""
+    """Kernel backend for the core scan.
+
+    "auto" reads the device and nothing else: triton on CUDA, Metal on Apple
+    silicon, torch otherwise. It never selects a "cuda" kernel, whose backward
+    is an approximate adjoint.
+
+    Every other value pins a code path. "torch", "triton", "cuda" and "mps" are
+    the default implementation of their family; a "<family>_<impl>" name pins an
+    exact one -- see docs/backends.md and :func:`kla.ops.kla_scan`."""
 
     scan_impl: ScanImpl = "auto"
     """Parallel-scan implementation used by the torch backend.

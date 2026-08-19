@@ -24,6 +24,9 @@ The no-grad forward instead takes the single fused kernel
 (:func:`~kla.ops.kernels.triton.fused_kla_scan.fused_kla_forward`), which avoids
 those round trips entirely.
 
+That choice is grad-mode driven under ``backend="triton"``; ``triton_fused`` and
+``triton_composed`` pin one path each (see ``kernel`` below).
+
 Status: the *composed* (training) path is still glue-heavy — the per-(b,l,m,s)
 torch elementwise around the kernels does several HBM passes, leaving it ~6–11×
 the fully-fused CUDA kernel; the next step is a fused **backward**. Note
@@ -71,11 +74,23 @@ def kla_scan_triton(
     p: torch.Tensor,
     initial_state: Optional[KLAState] = None,
     decode_from_prior: bool = False,
+    kernel: str = "auto",
 ):
-    """Triton-kernel KLA scan. Same contract as :func:`kla.ops.kla_scan_torch`."""
+    """Triton-kernel KLA scan. Same contract as :func:`kla.ops.kla_scan_torch`.
+
+    ``kernel`` pins which of the two triton paths runs: ``"auto"``
+    (``backend="triton"``) takes the fused forward when nothing needs an adjoint
+    and the tiled scans otherwise, while ``"fused"`` and ``"composed"`` are one
+    each. The fused kernel is forward-only, so pinning it raises rather than
+    silently falling back when a backward would be needed.
+    """
     tiled_mobius_scan, tiled_affine_scan, fused_kla_forward = _require_kernels()
     if not v.is_cuda:
         raise NotImplementedError("The triton KLA backend requires CUDA tensors.")
+    if kernel not in ("auto", "fused", "composed"):
+        raise ValueError(
+            f"Unknown triton kernel {kernel!r}; expected 'auto', 'fused' or 'composed'"
+        )
 
     v = v.float()
     lambda_v = lambda_v.float()
@@ -89,10 +104,28 @@ def kla_scan_triton(
     lam0 = initial_state.lam.float()
     eta0 = initial_state.eta.float()
 
+    if kernel == "fused":
+        if torch.is_grad_enabled() and any(
+            t.requires_grad for t in (v, lambda_v, k, q, a, p)
+        ):
+            raise NotImplementedError(
+                "The fused triton kernel is forward-only and has no backward; use "
+                "backend='triton' (which picks it whenever no adjoint is needed) "
+                "or 'triton_composed'."
+            )
+        if decode_from_prior:
+            raise NotImplementedError(
+                "The fused triton kernel does not support decode_from_prior; use "
+                "backend='triton' or 'triton_composed'."
+            )
+
     # Single fused kernel for the common inference/prefill case (no grad,
     # no prior decode) — no [B,L,M,S] HBM round-trips. The kernel consumes the
     # folded information mean v·Λ^v (pre-folded here; the kernel is unchanged).
-    if not torch.is_grad_enabled() and not decode_from_prior:
+    use_fused = kernel == "fused" or (
+        kernel == "auto" and not torch.is_grad_enabled() and not decode_from_prior
+    )
+    if use_fused:
         # p is floored here to match _broadcast_ap on the composed path below —
         # the fused kernel has no internal guard against a non-positive p.
         y, y_var, lam_fin, eta_fin = fused_kla_forward(

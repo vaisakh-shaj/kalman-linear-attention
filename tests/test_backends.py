@@ -1,7 +1,7 @@
 """Cross-backend parity: every available backend against the sequential reference.
 
-The three backends implement the same math with very different numerics, so each
-gets its own tolerance profile rather than one shared threshold:
+The backends implement the same math with very different numerics, so each gets
+its own tolerance profile rather than one shared threshold:
 
 * ``torch``  — the reference implementation. Forward and backward both tight.
 * ``triton`` — hand-written kernels with an exact reverse-scan adjoint. Tight.
@@ -10,17 +10,21 @@ gets its own tolerance profile rather than one shared threshold:
   notes in :mod:`kla.ops.cuda_backend`): gradients that flow through the
   precision scan are only accurate to ~5-15 % relative, while the ones that flow
   through the information-vector / read-out path are exact.
+* ``mps_fused`` / ``mps_composed`` — the two Metal strategies
+  (:mod:`kla.ops.mps_backend`). Both tight, *including the fused one*: applying
+  the Möbius map per step instead of composing it makes the adjoint elementary,
+  so the fused MPS kernel has none of the CUDA kernel's gradient looseness even
+  though it is the same fully-fused strategy.
 
-That last point is why :data:`PROFILES` splits the gradient inputs into
+The ``cuda`` point is why :data:`PROFILES` splits the gradient inputs into
 ``exact_grads`` and ``loose_grads``. Asserting a tight threshold on the loose
 group would fail on a *correct* build — the looseness is a documented property
 of that backward, not a bug to be caught here. If you want exact gradients, use
-``backend="torch"`` or ``"triton"``.
+anything except the ``cuda`` kernels.
 
-Backends that cannot run (no CUDA, no triton, no nvcc) raise
-:class:`NotImplementedError` from the dispatcher and are skipped, so this file is
-meaningful on a CPU-only box (where it degrades to torch-only) and on a GPU node
-without a CUDA toolkit (torch + triton).
+Backends that cannot run here raise :class:`NotImplementedError` from the
+dispatcher and are skipped, so this file is meaningful on a CPU-only box, on a
+GPU node with or without a CUDA toolkit, and on a Mac.
 """
 
 import dataclasses
@@ -56,7 +60,20 @@ class Profile:
     :func:`test_high_information_tokens_are_not_clipped` — that backend is
     *required* to deviate, so the test fails loudly if its clamp ever stops
     engaging."""
+    scan_form: str = (
+        "composes the same maps with a parallel associative scan over "
+        "trace-normalized 2x2 matrices"
+    )
+    """How this backend parallelizes the recurrence, for the printed reading of
+    the forward comparison. The point of that comparison is that the reference
+    and the backend reach the same numbers by *different* routes, so the report
+    has to say which route."""
 
+
+_LANE_FORM = (
+    "applies the same map down B*M*S independent lanes, one thread per "
+    "(batch, channel, state), with time as the serial axis"
+)
 
 PROFILES = {
     p.name: p
@@ -88,10 +105,32 @@ PROFILES = {
             supports_initial_state=False,
             clips_phi=True,
         ),
+        # Both Metal strategies get the exact-gradient contract. For the fused
+        # one that is the interesting claim: it is the same "one kernel, hand-
+        # written backward" shape as `cuda` above, yet every input is tight,
+        # because a per-step Moebius map has an elementary adjoint where a
+        # trace-normalized prefix product does not.
+        Profile(
+            "mps_fused",
+            5e-4,
+            5e-4,
+            exact_grads=INPUT_NAMES,
+            exact_grad_tol=1e-2,
+            scan_form=_LANE_FORM,
+        ),
+        Profile(
+            "mps_composed",
+            5e-4,
+            5e-4,
+            exact_grads=INPUT_NAMES,
+            exact_grad_tol=1e-2,
+            scan_form=_LANE_FORM,
+        ),
     ]
 }
 
 ALL_BACKENDS = list(PROFILES)
+MPS_BACKENDS = [name for name in PROFILES if name.startswith("mps")]
 
 
 def make_inputs(device, B=2, L=64, M=16, S=8, requires_grad=False):
@@ -129,13 +168,21 @@ def rel_err(got, ref):
     return ((got - ref).abs().max() / (ref.abs().max() + 1.0)).item()
 
 
+# Backend family -> the device it runs on, and how to ask whether we have one.
+_DEVICE = {"torch": "cpu", "triton": "cuda", "cuda": "cuda", "mps": "mps"}
+_HAVE = {
+    "cpu": lambda: True,
+    "cuda": torch.cuda.is_available,
+    "mps": torch.backends.mps.is_available,
+}
+
+
 def device_for(backend):
-    """torch is the CPU baseline; the kernel backends require a GPU."""
-    if backend == "torch":
-        return "cpu"
-    if not torch.cuda.is_available():
-        pytest.skip(f"backend {backend!r} needs CUDA")
-    return "cuda"
+    """torch is the CPU baseline; each kernel family names its own device."""
+    device = _DEVICE[backend.split("_", 1)[0]]
+    if not _HAVE[device]():
+        pytest.skip(f"backend {backend!r} needs a {device} device")
+    return device
 
 
 def report(title, rows, why=None):
@@ -191,10 +238,9 @@ def test_forward_matches_reference(backend):
         why=f"""
         PASS means agreement to {max(d_y, d_var):.1e} between two *different*
         algorithms, not two runs of one: the reference is a sequential python loop over
-        kla_step, while {backend} is a parallel associative scan
-        ({"in log space" if backend == "torch" else "in linear space, normalized"}).
-        Only the algebra is shared, so agreement at float32 noise level says the
-        parallel form is genuinely equivalent rather than merely self-consistent.
+        kla_step, while {backend} {prof.scan_form}. Only the algebra is shared, so
+        agreement at float32 noise level says the parallel form is genuinely
+        equivalent rather than merely self-consistent.
         """,
     )
 
@@ -631,3 +677,322 @@ def test_fused_non_unit_initial_state():
 
     torch.testing.assert_close(y, y_ref, atol=5e-4, rtol=5e-4)
     assert not torch.allclose(y, y_unit, atol=1e-3), "initial state was ignored"
+
+
+# ---------------------------------------------------------- the MPS backends
+#
+# The shared matrix above already runs both Metal backends against the
+# reference. What it cannot see is the *kernel geometry*: the fused kernels put
+# one thread on each (batch, channel, state) triple and one threadgroup on
+# [next_pow2(d_state), ROWS] channels, so correctness depends on shapes that
+# never come up in a single well-chosen test case -- padding lanes at
+# s >= d_state and m >= d_inner, a read-out reduction that switches from SIMD
+# shuffles to threadgroup memory past 32 states, and a backward that replays the
+# sequence in KLA_CHUNK-sized pieces from checkpoints. These target that.
+
+needs_mps = pytest.mark.skipif(
+    not torch.backends.mps.is_available(), reason="the Metal kernels need an Apple GPU"
+)
+
+CHUNK = 16  # kla.ops.kernels.mps._shaders.DEFAULT_CHUNK
+SIMD = 32  # a row wider than this drops to the threadgroup-memory reduction
+
+
+@needs_mps
+@pytest.mark.parametrize("backend", MPS_BACKENDS)
+@pytest.mark.parametrize("L", [1, CHUNK - 1, CHUNK, CHUNK + 1, 2 * CHUNK, 100])
+def test_mps_chunk_boundaries(backend, L):
+    """Forward and gradients across every position relative to the replay chunk.
+
+    The fused backward does not store λ_t or η_t. It checkpoints them every
+    ``CHUNK`` steps and replays the chunk forward before walking the adjoint
+    back down it, so the arithmetic differs between a sequence that fills its
+    chunks exactly and one that leaves a partial tail -- and the tail is
+    predicated inside a fully unrolled loop, which is exactly the kind of thing
+    that is either right or off by one. ``L=1`` also pins the degenerate case
+    where every carry is still at its seed value.
+    """
+    inputs = make_inputs("mps", L=L, requires_grad=True)
+    refs = tuple(t.detach().cpu().clone().requires_grad_(True) for t in inputs)
+
+    y, y_var, state = run_backend(backend, inputs)
+    y_ref, y_var_ref, ref_state = kla_scan_reference(*refs)
+    (y.square().sum() + y_var.sum()).backward()
+    (y_ref.square().sum() + y_var_ref.sum()).backward()
+
+    torch.testing.assert_close(y.cpu(), y_ref, atol=5e-4, rtol=5e-4)
+    torch.testing.assert_close(y_var.cpu(), y_var_ref, atol=5e-4, rtol=5e-4)
+    torch.testing.assert_close(state.lam.cpu(), ref_state.lam, atol=1e-3, rtol=1e-4)
+    for name, got, ref in zip(INPUT_NAMES, inputs, refs):
+        err = rel_err(got.grad.cpu(), ref.grad)
+        assert err < 1e-2, f"{backend} L={L}: d{name} off by {err:.2e}"
+
+
+@needs_mps
+@pytest.mark.parametrize("backend", MPS_BACKENDS)
+@pytest.mark.parametrize("S", [1, 3, SIMD // 2, SIMD, SIMD + 1, 2 * SIMD])
+@pytest.mark.parametrize("M", [1, 33])
+def test_mps_threadgroup_geometry(backend, S, M):
+    """Padding lanes must contribute exactly zero to every reduction.
+
+    A threadgroup is ``[next_pow2(S), ROWS]`` channels wide, so unless both
+    ``S`` and ``M`` divide those, some threads own no real (channel, state) at
+    all. They cannot simply exit -- the read-out reduction is a SIMD shuffle
+    (or, past ``SIMD`` states, a barrier), and both need every lane present. So
+    they run the whole kernel on neutral inputs instead, and this checks that
+    "neutral" really is neutral: an S of 3 leaves 5 padding lanes per row and an
+    M of 33 leaves 15 padding rows in the last group.
+
+    ``S`` also crosses the point where the read-out reduction switches
+    implementation, which is a different code path rather than a different
+    constant.
+    """
+    inputs = make_inputs("mps", B=2, L=CHUNK + 3, M=M, S=S, requires_grad=True)
+    refs = tuple(t.detach().cpu().clone().requires_grad_(True) for t in inputs)
+
+    y, y_var, _ = run_backend(backend, inputs)
+    y_ref, y_var_ref, _ = kla_scan_reference(*refs)
+    (y.square().sum() + y_var.sum()).backward()
+    (y_ref.square().sum() + y_var_ref.sum()).backward()
+
+    torch.testing.assert_close(y.cpu(), y_ref, atol=5e-4, rtol=5e-4)
+    torch.testing.assert_close(y_var.cpu(), y_var_ref, atol=5e-4, rtol=5e-4)
+    for name, got, ref in zip(INPUT_NAMES, inputs, refs):
+        err = rel_err(got.grad.cpu(), ref.grad)
+        assert err < 1e-2, f"{backend} S={S} M={M}: d{name} off by {err:.2e}"
+
+
+@needs_mps
+@pytest.mark.parametrize("L", [CHUNK, 100])
+def test_mps_strategies_agree(L):
+    """The two Metal strategies must agree, in both grad modes.
+
+    They share no kernel on the training path -- one is a single fused kernel
+    with a hand-written backward, the other is three scan kernels wrapped in
+    autograd -- so this is an independent cross-check of both, tighter than
+    either one's tolerance against the reference.
+    """
+    inputs = make_inputs("mps", L=L)
+    with torch.no_grad():
+        yf, vf, sf = kla_scan(*inputs, backend="mps_fused")
+        yc, vc, sc = kla_scan(*inputs, backend="mps_composed")
+    torch.testing.assert_close(yf, yc, atol=5e-5, rtol=5e-5)
+    torch.testing.assert_close(vf, vc, atol=5e-5, rtol=5e-5)
+    torch.testing.assert_close(sf.lam, sc.lam, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(sf.eta, sc.eta, atol=1e-4, rtol=1e-4)
+
+    # The tiled forward reaches the same numbers a third way -- composing the
+    # maps rather than applying them -- so it gets a looser budget.
+    with torch.no_grad():
+        yt, vt, st = kla_scan(*inputs, backend="mps_tiled")
+    torch.testing.assert_close(yt, yf, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(vt, vf, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(st.lam, sf.lam, atol=1e-3, rtol=1e-3)
+
+    grads = []
+    for backend in ("mps_fused", "mps_composed"):
+        inputs = make_inputs("mps", L=L, requires_grad=True)
+        y, y_var, _ = kla_scan(*inputs, backend=backend)
+        (y.square().sum() + y_var.sum()).backward()
+        grads.append([t.grad for t in inputs])
+    for name, gf, gc in zip(INPUT_NAMES, *grads):
+        torch.testing.assert_close(gf, gc, atol=1e-4, rtol=1e-3, msg=f"d{name}")
+
+
+@needs_mps
+@pytest.mark.parametrize("backend", MPS_BACKENDS)
+def test_mps_state_gradient_flows(backend):
+    """Gradients must flow *through* the returned filter state, not stop at it.
+
+    This is the one the CUDA kernel cannot do at all -- it returns ``None`` for
+    the state and is training-only for that reason. Both Metal backends carry
+    ``lam0``/``eta0`` in and hand the final state back inside the graph, which
+    is what makes truncated BPTT over chunked sequences work. A backward that
+    merely ignored the incoming state gradient would still pass every other test
+    in this file, so it needs its own: the loss here reads *only* the state.
+    """
+    inputs = make_inputs("mps", L=CHUNK + 5, requires_grad=True)
+    refs = tuple(t.detach().cpu().clone().requires_grad_(True) for t in inputs)
+
+    _, _, state = run_backend(backend, inputs)
+    _, _, ref_state = kla_scan_reference(*refs)
+    (state.lam.square().sum() + state.eta.sum()).backward()
+    (ref_state.lam.square().sum() + ref_state.eta.sum()).backward()
+
+    rows = []
+    for name, got, ref in zip(INPUT_NAMES, inputs, refs):
+        if ref.grad is None:  # q enters only through the read-out
+            assert got.grad is None or got.grad.abs().max() == 0
+            continue
+        rows.append((f"d{name}", rel_err(got.grad.cpu(), ref.grad), "budget 1e-2"))
+    report(
+        f"{backend}: gradient of the carried state vs the reference",
+        rows,
+        why="""
+        The loss reads the returned (lambda, eta) and nothing else, so every number
+        here arrived by seeding the reverse walk with d(lam_fin)/d(eta_fin). PASS
+        means chunked training carries gradient across the chunk boundary; the CUDA
+        backend has no equivalent, since it returns no state.
+        """,
+    )
+    over = [f"{n} {e:.2e}" for n, e, _ in rows if e >= 1e-2]
+    assert not over, f"{backend}: state gradients outside budget: {'; '.join(over)}"
+
+
+TILE = 128  # ROWS * ITEMS at d_state=16: the tiled kernel's timesteps per pass
+
+
+@needs_mps
+@pytest.mark.parametrize("L", [1, 7, TILE - 1, TILE, TILE + 1, 2 * TILE, 300])
+@pytest.mark.parametrize("S", [1, 3, 16, 32, 64])
+def test_mps_tiled_forward(L, S):
+    """The time-parallel forward, across every position relative to a tile.
+
+    This kernel is the one that splits a tile of timesteps across a threadgroup
+    and composes 2x2 Moebius matrices to stitch them, so its failure modes are
+    the boundary ones: a sequence that ends mid-tile leaves later threads with
+    no work, and their aggregates have to be the identity rather than garbage.
+    ``S`` also crosses the width where the read-out reduction stops fitting in a
+    SIMD-group and starts using barriers -- which every thread must now reach,
+    including ones whose timesteps are all past the end.
+    """
+    inputs = make_inputs("mps", B=2, L=L, M=3, S=S)
+    refs = tuple(t.cpu() for t in inputs)
+
+    with torch.no_grad():
+        y, y_var, state = kla_scan(*inputs, backend="mps_tiled")
+    y_ref, y_var_ref, ref_state = kla_scan_reference(*refs)
+
+    torch.testing.assert_close(y.cpu(), y_ref, atol=5e-4, rtol=5e-4)
+    torch.testing.assert_close(y_var.cpu(), y_var_ref, atol=5e-4, rtol=5e-4)
+    torch.testing.assert_close(state.lam.cpu(), ref_state.lam, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(state.eta.cpu(), ref_state.eta, atol=1e-3, rtol=1e-3)
+
+
+@needs_mps
+def test_mps_tiled_refuses_to_train():
+    """Forward-only, and it must say so rather than return a detached answer.
+
+    ``triton_fused`` has the same contract for the same reason. A silent
+    fallback would be worse than the error: you would train against a different
+    kernel than the one you named.
+    """
+    inputs = make_inputs("mps", requires_grad=True)
+    with pytest.raises(NotImplementedError, match="forward-only"):
+        kla_scan(*inputs, backend="mps_tiled")
+
+    # ...but inference on the same tensors is fine.
+    with torch.no_grad():
+        y, _, _ = kla_scan(*inputs, backend="mps_tiled")
+    assert torch.isfinite(y).all()
+
+
+@needs_mps
+@pytest.mark.parametrize("backend", ["auto", *MPS_BACKENDS])
+def test_mps_decode_from_prior(backend):
+    """The prior read-out has to be inside the fused kernel, not around it.
+
+    The composed path can apply it afterwards in torch, on the ``[B,L,M,S]``
+    mean and variance it already materialized. The fused kernel materializes
+    neither, so ``mean = a.mean`` and ``var = a^2.var + p`` happen between the
+    per-lane update and the reduction, and their adjoint has to feed back into
+    ``a`` and ``p`` as well as into the scan.
+    """
+    inputs = make_inputs("mps", L=CHUNK + 5, requires_grad=True)
+    refs = tuple(t.detach().cpu().clone().requires_grad_(True) for t in inputs)
+
+    y, y_var, _ = run_backend(backend, inputs, decode_from_prior=True)
+    y_ref, y_var_ref, _ = kla_scan_reference(*refs, decode_from_prior=True)
+    (y.square().sum() + y_var.sum()).backward()
+    (y_ref.square().sum() + y_var_ref.sum()).backward()
+
+    torch.testing.assert_close(y.cpu(), y_ref, atol=5e-4, rtol=5e-4)
+    torch.testing.assert_close(y_var.cpu(), y_var_ref, atol=5e-4, rtol=5e-4)
+    for name, got, ref in zip(INPUT_NAMES, inputs, refs):
+        err = rel_err(got.grad.cpu(), ref.grad)
+        assert err < 1e-2, f"{backend}: d{name} off by {err:.2e}"
+
+
+@needs_mps
+def test_mps_auto_does_not_route_around_the_d_state_ceiling():
+    """ "auto" resolves on the device alone, so a limit surfaces as an error.
+
+    ``d_state`` past the fused kernels' cap is the one request they do not
+    cover, and ``mps_composed`` does -- but swapping it in silently would make
+    the kernels a run used a function of its inputs. So the refusal names the
+    backend that works and leaves the choice to the caller, and the message is
+    the whole user interface for it.
+    """
+    from kla.ops.kernels.mps import MAX_DSTATE
+
+    wide = make_inputs("mps", B=1, L=8, M=2, S=MAX_DSTATE + 1)
+    for backend in ("auto", "mps", "mps_fused"):
+        with pytest.raises(NotImplementedError, match="d_state") as excinfo:
+            kla_scan(*wide, backend=backend)
+        assert "mps_composed" in str(excinfo.value)
+
+    y, y_var, _ = kla_scan(*wide, backend="mps_composed")
+    y_ref, y_var_ref, _ = kla_scan_reference(*(t.cpu() for t in wide))
+    torch.testing.assert_close(y.cpu(), y_ref, atol=5e-4, rtol=5e-4)
+    torch.testing.assert_close(y_var.cpu(), y_var_ref, atol=5e-4, rtol=5e-4)
+
+
+@needs_mps
+@pytest.mark.parametrize("backend", MPS_BACKENDS)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mps_widens_low_precision_inputs(backend, dtype):
+    """Half-precision activations must be widened to float32, as torch's are.
+
+    The scan is numerically delicate and every backend runs it in float32
+    regardless of what came in (:func:`kla.ops.kla_ops._compute_dtype`); the
+    layer casts back afterwards. Worth pinning on Metal specifically because the
+    kernels read raw float32 pointers with computed offsets, so a half tensor
+    reaching one would not be a precision question -- it would be a
+    misinterpreted buffer.
+
+    float64 has no test here because it cannot arise: MPS refuses to allocate
+    one at all, which is also why ``tests/test_gradcheck.py`` skips this device.
+    """
+    inputs = tuple(t.to(dtype) for t in make_inputs("mps"))
+    refs = tuple(t.cpu() for t in inputs)
+
+    y, y_var, _ = run_backend(backend, inputs)
+    y_ref, y_var_ref, _ = kla_scan_reference(*refs)
+
+    assert y.dtype == torch.float32, "the scan runs and returns float32"
+    torch.testing.assert_close(y.cpu(), y_ref, atol=5e-4, rtol=5e-4)
+    torch.testing.assert_close(y_var.cpu(), y_var_ref, atol=5e-4, rtol=5e-4)
+
+
+# ------------------------------------------------------ dispatch-table cover
+#
+# PROFILES is written by hand, so a backend added to the dispatcher would
+# silently get no parity coverage at all. This is the guard.
+
+COVERED_ELSEWHERE = {
+    # Aliases of a profiled entry: same kernels, so parity is already asserted.
+    "cuda": "alias of cuda_v2_2",
+    "cuda_v2_2": "same kernel as the profiled 'cuda'",
+    "mps": "alias of the profiled mps_fused",
+    # Forward-only, so it cannot take the shared backward test.
+    "mps_tiled": "forward-only; covered by the tiled-kernel tests above",
+    "triton": "picks triton_fused or triton_composed by grad mode",
+    "triton_composed": "the path profiled 'triton' takes under grad",
+    # Forward-only, so it cannot take the shared backward test.
+    "triton_fused": "forward-only; covered by the fused-kernel tests above",
+}
+
+
+def test_every_backend_is_covered():
+    """Each dispatcher entry is either profiled here or explicitly excused."""
+    from kla.ops import backend_names
+
+    unaccounted = [
+        name
+        for name in backend_names()
+        if name not in PROFILES and name not in COVERED_ELSEWHERE
+    ]
+    assert not unaccounted, (
+        f"backend(s) {unaccounted} have no parity coverage: add a Profile, or a "
+        "COVERED_ELSEWHERE entry saying which test covers them"
+    )
