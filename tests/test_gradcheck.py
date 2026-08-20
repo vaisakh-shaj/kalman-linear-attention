@@ -69,6 +69,57 @@ def test_gradcheck_scan_float64(device, scan_impl):
     assert torch.autograd.gradcheck(f, inputs, eps=1e-6, atol=1e-5, rtol=1e-3)
 
 
+@pytest.mark.parametrize("scan_impl", ["doubling", "chunk"])
+def test_gradcheck_merged_scan_float64(device, scan_impl):
+    """The merged 3x3 composition, against central differences.
+
+    ``merged=True`` composes one map for both recurrences instead of a Möbius
+    map followed by an affine one (see ``kla.ops.kla_ops._merged_combine`` and
+    ``tests/test_merged_algebra.py``, which pins the algebra). Its *forward* is
+    checked there against the sequential reference; this is the check that
+    differentiating through the merged composition is also right, and it is the
+    only place it can happen: the merged Metal cells are float32-only, and their
+    hand-written backward is anchored by parity against this path in
+    ``tests/test_backends.py``.
+
+    That anchoring is not circular only because those kernels do not
+    differentiate the composed map at all -- they replay a scalar recurrence
+    from checkpoints. So this test covers the merged *algebra*'s gradient, and
+    parity covers the kernels'.
+    """
+    inputs = _inputs(device)
+
+    def f(*args):
+        y, y_var, _ = kla_scan_torch(*args, scan_impl=scan_impl, merged=True)
+        return y, y_var
+
+    assert torch.autograd.gradcheck(f, inputs, eps=1e-6, atol=1e-5, rtol=1e-3)
+
+
+def test_gradcheck_merged_state_and_prior(device):
+    """The lam0/eta0 boundary terms and the prior decode, through the 3x3 map.
+
+    η₀ enters the merged map through the (3,3) entry rather than through an
+    affine map's multiplier, which is the one gradient path with no counterpart
+    in the two-scan form.
+    """
+    inputs = _inputs(device)
+    base = init_state(B, M, S, device=device, dtype=torch.float64)
+    state = type(base)(lam=base.lam * 2.0, eta=base.eta + 0.3)
+
+    def f(*args):
+        y, y_var, _ = kla_scan_torch(
+            *args,
+            initial_state=state,
+            scan_impl="doubling",
+            merged=True,
+            decode_from_prior=True,
+        )
+        return y, y_var
+
+    assert torch.autograd.gradcheck(f, inputs, eps=1e-6, atol=1e-5, rtol=1e-3)
+
+
 def test_gradcheck_scan_with_initial_state(device):
     """The lam0/eta0 boundary terms must also be differentiated correctly."""
     inputs = _inputs(device)

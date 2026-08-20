@@ -2,10 +2,10 @@
 
 One algorithm, several implementations of its core scan. Each one is named by
 two things: which **backend** compiles it, and which **implementation** it uses to get
-through the sequence.
+through the sequence. The middle token says how much is folded together.
 
 ```
-<backend>[_unfused]_<implementation>
+<backend>[_unfused|_merged]_<implementation>
 ```
 
 ## The three implementations
@@ -62,10 +62,12 @@ batch-1 prefill of a long sequence, and rarely otherwise.
 
 **Rule of thumb:** the implementations split on how many lanes `B x d_inner x d_state`
 gives you, since that is `recurrent`'s entire grid. Measured on an M5 Pro:
-`recurrent` above ~4k lanes, `chunk` from ~512 to ~4k, `pscan` below that.
-Every realistic config is in `recurrent`'s range — 4k lanes is `d_model=128` at
-batch 1 — which is why it is the default on the two backends that have been
-measured. See [benchmarks/mps.md](benchmarks/mps.md).
+`recurrent` above ~8k lanes, `merged_chunk` from ~512 to ~8k, `pscan` below
+that. Every realistic config is in `recurrent`'s range — 8k lanes is
+`d_model=256` at batch 1 — which is why it is the default on the two backends
+that have been measured. `merged_chunk` moved that boundary out from ~4k, where
+it sat when `chunk` was the middle option. See
+[benchmarks/mps.md](benchmarks/mps.md).
 
 ## fused and unfused
 
@@ -76,6 +78,28 @@ kernel. The big intermediate tensors never reach memory.
 Slower, because those intermediates do reach memory, but it is easier to read
 and to change. It is the reference the fused versions are checked against.
 
+**merged** is fused *and* runs one scan instead of two.
+
+| | intermediates | scans |
+|---|---|---|
+| `unfused` | `[B,L,M,S]` in memory | two |
+| `fused` | per-chunk only | two |
+| `merged` | per-chunk only | **one** |
+
+Every composing implementation runs two scans, and it is not a choice: the
+Kalman gain `alpha_t` reads `lambda_{t-1}`, so the information vector's leaves
+do not exist until the precision scan has produced `lambda`. `merged` writes
+the whole step as one 3x3 map in homogeneous coordinates instead — with
+`lambda = u/v` the precision map is already the 2x2 the other cells compose, and
+`eta = w/v` rides in the same coordinates — so the leaf depends on the inputs
+alone and the dependency is gone. See `kla.ops.kla_ops._merged_combine` and
+`src/kla/ops/kernels/mps/kla_merged.metal`.
+
+**`merged` does not apply to `recurrent`.** That implementation *applies* the
+map rather than composing it, so it has `lambda_{t-1}` in hand and already does
+both recurrences in one pass. A merged variant would be the same kernel under a
+second name, which is the defect this naming scheme exists to prevent.
+
 ## The matrix
 
 | | recurrent | chunk | pscan |
@@ -85,6 +109,15 @@ and to change. It is the reference the fused versions are checked against.
 | **triton, unfused** | `triton_unfused_recurrent` | `triton_unfused_chunk` | `triton_unfused_pscan` |
 | **cuda** | `cuda_recurrent` | `cuda_chunk` | `cuda_pscan` |
 | **mps** | `mps_recurrent` | `mps_chunk` | `mps_pscan` |
+| **torch, merged** | — | `torch_merged_chunk` | `torch_merged_pscan` |
+| **mps, merged** | — | `mps_merged_chunk` | `mps_merged_pscan` |
+
+torch has no *fused* cells, so `torch_merged_*` means "unfused, but one scan":
+the single axis cannot spell both tokens, and unfused is what torch always is.
+They are kept because they are the only merged cells that run float64, which is
+what lets the merged algebra be gradchecked (`tests/test_gradcheck.py`) rather
+than only compared against another float32 implementation. `triton` and `cuda`
+have no merged cells yet.
 
 A bare backend name means that backend's default:
 

@@ -3,7 +3,7 @@
 The backends implement the same math with very different numerics, so each gets
 its own tolerance profile rather than one shared threshold:
 
-Implementations are named ``<backend>[_unfused]_<implementation>`` — see
+Implementations are named ``<backend>[_unfused|_merged]_<implementation>`` — see
 ``docs/implementations.md``.
 
 * ``torch_unfused_*`` — the reference. Forward and backward both tight.
@@ -13,6 +13,11 @@ Implementations are named ``<backend>[_unfused]_<implementation>`` — see
   notes in :mod:`kla.ops.cuda_backend`): gradients that flow through the
   precision scan are only accurate to ~5-15 % relative, while the ones that flow
   through the information-vector / read-out path are exact.
+* ``*_merged_*`` — one associative scan for both recurrences instead of two
+  (:func:`kla.ops.kla_ops._merged_combine`). Same tolerances as the two-scan
+  cells they replace, deliberately: a merged cell needing a looser budget would
+  be a regression, not a variant. The algebra is pinned separately in
+  ``tests/test_merged_algebra.py``.
 * ``mps_*`` — the Metal kernels (:mod:`kla.ops.mps_backend`). Tight *despite*
   being fully fused: applying the Möbius map per step instead of composing it
   makes the adjoint elementary, so they have none of the CUDA kernels' gradient
@@ -77,12 +82,36 @@ _LANE_FORM = (
     "(batch, channel, state), with time as the serial axis"
 )
 
+_MERGED_FORM = (
+    "folds both recurrences into one associative scan over trace-normalized "
+    "3x3 maps in homogeneous coordinates, so eta is never scanned separately"
+)
+
 PROFILES = {
     p.name: p
     for p in [
         Profile("torch_unfused_pscan", 2e-4, 1e-4, exact_grads=INPUT_NAMES),
         Profile("torch_unfused_recurrent", 2e-4, 1e-4, exact_grads=INPUT_NAMES),
         Profile("torch_unfused_chunk", 2e-4, 1e-4, exact_grads=INPUT_NAMES),
+        # The merged cells compose ONE map for both recurrences (the 3x3 of
+        # kla_ops._merged_combine) where every other cell composes two. Same
+        # tolerance as the two-scan torch cells: lambda is bit-identical by
+        # construction and eta stays at the fp32 floor -- pinned, with the
+        # measured numbers, in tests/test_merged_algebra.py.
+        Profile(
+            "torch_merged_chunk",
+            2e-4,
+            1e-4,
+            exact_grads=INPUT_NAMES,
+            scan_form=_MERGED_FORM,
+        ),
+        Profile(
+            "torch_merged_pscan",
+            2e-4,
+            1e-4,
+            exact_grads=INPUT_NAMES,
+            scan_form=_MERGED_FORM,
+        ),
         # Both triton chunk cells get the exact-gradient contract: the fused one
         # shares kla.ops.kernels.triton.kla_scan_bwd, which differentiates the
         # recurrence rather than the composed map.
@@ -232,6 +261,33 @@ PROFILES = {
             scan_form=(
                 "composes the same maps per chunk, then resolves the chunks "
                 "with a parallel scan carrying nothing between them"
+            ),
+        ),
+        # The merged Metal cells. Same forwards as the two above with the second
+        # scan removed, and the same lane-per-state backward again -- which is
+        # the claim worth checking here: merging is a property of the forward's
+        # composition, and kla_scan_bwd replays a scalar recurrence from
+        # checkpoints, so it must not be able to tell the difference. Same
+        # tolerances as their two-scan counterparts, deliberately: a merged cell
+        # that needed a looser budget would be a regression, not a variant.
+        Profile(
+            "mps_merged_chunk",
+            1e-3,
+            1e-3,
+            exact_grads=INPUT_NAMES,
+            exact_grad_tol=1e-2,
+            scan_form=_MERGED_FORM,
+        ),
+        Profile(
+            "mps_merged_pscan",
+            1e-3,
+            1e-3,
+            exact_grads=INPUT_NAMES,
+            exact_grad_tol=1e-2,
+            scan_form=(
+                "folds both recurrences into one 3x3 composition per chunk, "
+                "then resolves the chunks with a parallel scan carrying nothing "
+                "between them"
             ),
         ),
     ]

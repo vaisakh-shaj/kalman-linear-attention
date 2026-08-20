@@ -116,6 +116,55 @@ def kla_scan_mps_chunk(
     return y, y_var, KLAState(lam=lam_fin, eta=eta_fin)
 
 
+def kla_scan_mps_merged_chunk(
+    v: torch.Tensor,
+    lambda_v: torch.Tensor,
+    k: torch.Tensor,
+    q: torch.Tensor,
+    a: torch.Tensor,
+    p: torch.Tensor,
+    initial_state: Optional[KLAState] = None,
+    decode_from_prior: bool = False,
+):
+    """Time-parallel MPS scan, one scan for both recurrences.
+
+    :func:`kla_scan_mps_chunk` with the precision map and the information vector
+    folded into a single 3x3 composition, so the tile runs three phases instead
+    of six. Same contract as :func:`kla.ops.kla_scan_torch`, same backward.
+    """
+    from kla.ops.kernels.mps._shaders import MAX_DSTATE, require_mps
+    from kla.ops.kernels.mps.merged_chunk_kla_scan import merged_chunk_kla_scan
+
+    require_mps()
+    if not v.is_mps:
+        raise _unsupported("requires 'mps' tensors", "merged chunk")
+    if a.dim() != 2:
+        raise _unsupported("expects a/p of shape [M, S]", "merged chunk")
+    S = k.shape[2]
+    if S > MAX_DSTATE:
+        raise _unsupported(
+            f"supports d_state <= {MAX_DSTATE} (got {S})", "merged chunk"
+        )
+
+    v, lambda_v, k, q, lam0, eta0 = _prepare(v, lambda_v, k, q, initial_state)
+
+    # As in every other cell: fold v·Λ^v in torch so autograd splits d(v·Λ^v)
+    # back into dv and d(Λ^v), and floor p here so the floor's subgradient is
+    # torch's too.
+    y, y_var, lam_fin, eta_fin = merged_chunk_kla_scan(
+        (v * lambda_v).contiguous(),
+        lambda_v,
+        k,
+        q,
+        a.float().contiguous(),
+        p.float().clamp_min(P_MIN).contiguous(),
+        lam0.contiguous(),
+        eta0.contiguous(),
+        decode_from_prior,
+    )
+    return y, y_var, KLAState(lam=lam_fin, eta=eta_fin)
+
+
 def kla_scan_mps_pscan(
     v: torch.Tensor,
     lambda_v: torch.Tensor,
@@ -145,6 +194,55 @@ def kla_scan_mps_pscan(
     # d(v·Λ^v) back into dv and d(Λ^v), and floor p here so the floor's
     # subgradient is torch's too.
     y, y_var, lam_fin, eta_fin = pscan_kla_scan(
+        (v * lambda_v).contiguous(),
+        lambda_v,
+        k,
+        q,
+        a.float().contiguous(),
+        p.float().clamp_min(P_MIN).contiguous(),
+        lam0.contiguous(),
+        eta0.contiguous(),
+        decode_from_prior,
+    )
+    return y, y_var, KLAState(lam=lam_fin, eta=eta_fin)
+
+
+def kla_scan_mps_merged_pscan(
+    v: torch.Tensor,
+    lambda_v: torch.Tensor,
+    k: torch.Tensor,
+    q: torch.Tensor,
+    a: torch.Tensor,
+    p: torch.Tensor,
+    initial_state: Optional[KLAState] = None,
+    decode_from_prior: bool = False,
+):
+    """Reduce-then-scan MPS scan, one round for both recurrences.
+
+    :func:`kla_scan_mps_pscan` with the second reduce-scan-apply round removed:
+    the merged 3x3 leaf carries η, so there is no set of affine leaves waiting
+    on λ. Same contract as :func:`kla.ops.kla_scan_torch`, same backward.
+    """
+    from kla.ops.kernels.mps._shaders import MAX_DSTATE, require_mps
+    from kla.ops.kernels.mps.merged_pscan_kla_scan import merged_pscan_kla_scan
+
+    require_mps()
+    if not v.is_mps:
+        raise _unsupported("requires 'mps' tensors", "merged pscan")
+    if a.dim() != 2:
+        raise _unsupported("expects a/p of shape [M, S]", "merged pscan")
+    S = k.shape[2]
+    if S > MAX_DSTATE:
+        raise _unsupported(
+            f"supports d_state <= {MAX_DSTATE} (got {S})", "merged pscan"
+        )
+
+    v, lambda_v, k, q, lam0, eta0 = _prepare(v, lambda_v, k, q, initial_state)
+
+    # As in every other cell: fold v·Λ^v in torch so autograd splits d(v·Λ^v)
+    # back into dv and d(Λ^v), and floor p here so the floor's subgradient is
+    # torch's too.
+    y, y_var, lam_fin, eta_fin = merged_pscan_kla_scan(
         (v * lambda_v).contiguous(),
         lambda_v,
         k,

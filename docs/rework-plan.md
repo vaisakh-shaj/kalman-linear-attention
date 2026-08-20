@@ -18,8 +18,10 @@ costs nothing and the alternative is boilerplate that outlives its purpose.
 
 ## The scheme
 
-Name: `<backend>[_unfused]_<implementation>`. Fused is the default and carries no
-token. A bare `<backend>` is a fixed alias for `<backend>_chunk`.
+Name: `<backend>[_unfused|_merged]_<implementation>`. Fused is the default and
+carries no token. A bare `<backend>` is a fixed alias for `<backend>_chunk`.
+`merged` was added later — fused *and* one scan instead of two; see
+`docs/implementations.md` and `PLAN.md`.
 
 | | recurrent | chunk *(default)* | pscan |
 |---|---|---|---|
@@ -29,6 +31,8 @@ token. A bare `<backend>` is a fixed alias for `<backend>_chunk`.
 | **cuda** | `cuda_recurrent` | `cuda_chunk` | `cuda_pscan` |
 | **mps** | `mps_recurrent` | `mps_chunk` | `mps_pscan` |
 | **cuda, prior work** | — | `cuda_v2_1`, `cuda_v2_2` | — |
+| **torch, merged** | — | `torch_merged_chunk` | `torch_merged_pscan` |
+| **mps, merged** | — | `mps_merged_chunk` | `mps_merged_pscan` |
 
 See `docs/implementations.md` for what the three implementations mean.
 

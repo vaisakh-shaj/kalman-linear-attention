@@ -96,6 +96,104 @@ B=1, `no_grad`, L=16384:
 
 Training is B=4, inference B=1 `no_grad`.
 
+## merged vs the two-scan cells
+
+`merged` folds the precision scan and the information-vector scan into one — see
+[../implementations.md](../implementations.md). These are the same process and
+the same session, so the columns are comparable to each other; they are not
+comparable to the tables above, which were a different run.
+
+Inference — B=1, `no_grad`, `d_model=512`, ms per call:
+
+| L | mps_rec | mps_chunk | mps_merged_chunk | mps_pscan | mps_merged_pscan |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 2.21 | 0.81 | **0.76** | 0.95 | 0.88 |
+| 512 | 1.76 | 1.83 | **1.61** | 2.06 | 2.18 |
+| 1024 | 2.65 | 3.24 | **2.75** | 4.09 | 4.29 |
+| 2048 | 4.78 | 5.99 | **5.04** | 8.48 | 8.72 |
+| 4096 | 9.67 | 12.08 | **10.18** | 17.93 | 18.29 |
+| 8192 | 18.90 | 23.98 | **19.83** | 36.62 | 37.56 |
+
+Training — B=8, forward + backward, ms per call:
+
+| L | mps_rec | mps_chunk | mps_merged_chunk | mps_pscan | mps_merged_pscan |
+|---:|---:|---:|---:|---:|---:|
+| 512 | 31.71 | 34.67 | 33.10 | 39.34 | 38.35 |
+| 1024 | 62.85 | 68.76 | 65.78 | 78.47 | 76.71 |
+| 2048 | 129.14 | 137.82 | 130.60 | 159.54 | 158.18 |
+| 4096 | 259.02 | 277.51 | 264.53 | 331.91 | 330.16 |
+
+Lane count — B=1, `no_grad`, where `chunk` and `pscan` exist at all:
+
+L=1024:
+
+| lanes | d_model | rec | chunk | merged_chunk | pscan | merged_pscan |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 32 | 1.60 | 0.60 | 0.59 | 0.60 | **0.56** |
+| 2048 | 64 | 1.40 | 0.69 | **0.59** | 0.73 | 0.70 |
+| 4096 | 128 | 1.01 | 1.01 | **0.82** | 1.18 | 1.11 |
+| 8192 | 256 | **1.27** | 1.60 | 1.33 | 1.92 | 1.97 |
+| 16384 | 512 | **2.64** | 3.23 | 3.12 | 4.41 | 4.90 |
+
+L=16384:
+
+| lanes | d_model | rec | chunk | merged_chunk | pscan | merged_pscan |
+|---:|---:|---:|---:|---:|---:|---:|
+| 256 | 8 | 7.20 | 2.35 | 1.67 | **1.33** | 1.34 |
+| 512 | 16 | 7.19 | 2.15 | **1.64** | 1.99 | 2.43 |
+| 1024 | 32 | 7.74 | 3.25 | **2.55** | 4.39 | 4.98 |
+
+One realistic shape, `d_model=1024`, `d_state=16`, L=2048 — each row its own
+process, ms per call:
+
+| | rec | chunk | merged_chunk | pscan | merged_pscan |
+|---|---:|---:|---:|---:|---:|
+| B=1 inference (32k lanes) | **13.21** | 16.14 | 14.10 | 21.27 | 21.07 |
+| B=8 training | **343.57** | 367.41 | 352.85 | 408.46 | 408.59 |
+
+Deep in `recurrent`'s regime, as every realistic config is. `merged_chunk`
+closes about 70 % of `chunk`'s gap to `recurrent` in inference and about 60 % of
+it in training, without ever overtaking it.
+
+### The reading
+
+**`merged_chunk` wins, by 15–30 %.** It beats `mps_chunk` at every shape
+measured, and the margin is widest exactly where `chunk` is the implementation you would
+actually pick — low lane count and a long sequence, where `chunk`'s six phases
+per tile dominate. At 256 lanes and L=16384 it is 29 % faster (2.35 → 1.67 ms)
+and comes within 25 % of `pscan`. The saving is structural, not arithmetic: one
+threadgroup scan instead of two, one broadcast instead of two, and the
+`var_h`/`alpha_h`/`r_h` per-thread arrays gone — 24 registers at `ITEMS=8`, on a
+kernel whose entire purpose is occupancy.
+
+**It moves the alias boundary but does not cross it.** `merged_chunk` now beats
+`mps_recurrent` at 4096 lanes (0.82 vs 1.01 ms), where plain `chunk` only tied.
+`recurrent` still wins from ~8k lanes up, and by more in training, so `mps`
+stays aliased to `mps_recurrent` — but the crossover moved from ~4k lanes to
+~8k, which is `d_model=256` at batch 1 rather than `d_model=128`.
+
+**`merged_pscan` is a wash**, and the reason is worth recording. It does drop
+two of five kernels and one of two doubling rounds, but that implementation is
+bandwidth-bound on its `[B,M,NCK,S]` aggregate array, and the merged aggregate
+is *wider*: 8 floats (7 live + 1 padding) against a float4 plus a float2, over
+one ping-ponged pair instead of two. 16 floats per `(b,m,c,s)` against 12, so
+512 MiB against 384 MiB at B=8, L=1024, `d_inner=1024`, `d_state=16`. The extra
+traffic through `log2(NCK)` doubling rounds eats the round it saved. It wins
+slightly at the smallest lane counts, where the aggregate array is small, and
+loses slightly above ~4k lanes.
+
+Six of the seven carried values would fit the 24-byte budget exactly, since
+`D = 1 - A` after trace normalization — but `D` is the small entry, so
+reconstructing it gives it a relative error of `eps/D`, measured at 2.7e-4
+against 5.0e-7 in λ at decay 0.3. Three orders of magnitude on the quantity λ is
+most sensitive to, to save four bytes.
+`tests/test_merged_algebra.py::test_reconstructing_D_is_not_free` pins that, so
+the layout question stays settled.
+
+**Training dilutes everything**, as it should: the backward is
+`kla_scan_bwd`, shared by all five cells and untouched by any of this, so a
+forward-only saving of 20 % shows up as 4–5 % of a training step.
+
 ## Defaults set from this
 
 | | was | is |

@@ -345,7 +345,7 @@ def main(
                 )
                 note = "" if impl.exact_bwd else "   approximate backward"
                 default = "  <- default" if aliases.get(name) == cell else ""
-                fused = "fused  " if impl.fused else "unfused"
+                fused = f"{impl.fusion:<7}"
                 print(
                     f"        {cell:<{cell_width}}  {fused}  "
                     f"{impl.implementation:<9}  {cap}{note}{default}"

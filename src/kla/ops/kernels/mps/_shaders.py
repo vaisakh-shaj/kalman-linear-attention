@@ -115,6 +115,29 @@ def chunk_library(d_state: int, items: int = DEFAULT_ITEMS, chunk: int = DEFAULT
     return _library(("chunk_kla_scan",), block_s, rows, chunk, items)
 
 
+def merged_chunk_library(
+    d_state: int, items: int = DEFAULT_ITEMS, chunk: int = DEFAULT_CHUNK
+):
+    """``mps_merged_chunk``'s forward. Same geometry as :func:`chunk_library`.
+
+    The only difference is the source list: the merged cells pull in
+    ``kla_merged.metal``, which holds the 3x3 map both of them compose, rather
+    than each carrying its own copy of the algebra the way the 2x2 cells do.
+    """
+    _require_dstate(d_state, "mps_merged_chunk")
+    block_s, rows = tile_geometry(d_state)
+    return _library(
+        ("kla_merged", "merged_chunk_kla_scan"), block_s, rows, chunk, items
+    )
+
+
+def merged_pscan_library(d_state: int, chunk: int = DEFAULT_CHUNK):
+    """``mps_merged_pscan``'s three kernels. Same geometry as :func:`pscan_library`."""
+    _require_dstate(d_state, "mps_merged_pscan")
+    block_s, rows = tile_geometry(d_state)
+    return _library(("kla_merged", "merged_pscan_kla_scan"), block_s, rows, chunk)
+
+
 def recurrent_library(d_state: int, chunk: int = DEFAULT_CHUNK):
     """``mps_recurrent``'s forward, specialized on the state width."""
     _require_dstate(d_state, "mps_recurrent")

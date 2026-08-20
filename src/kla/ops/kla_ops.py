@@ -116,6 +116,91 @@ def _mobius_combine_tracenorm(left, right):
     return a * inv, b * inv, c * inv, d * inv
 
 
+def _merged_combine(left, right):
+    """Compose two 3x3 merged maps, normalized by the 2x2 block's trace.
+
+    The precision map and the information vector in *one* associative combine.
+    :func:`_mobius_combine_tracenorm` composes λ alone, and η then needs a
+    second scan whose leaves (α_t, r_t) do not exist until that first scan has
+    produced λ_{t-1}. Writing the step in homogeneous coordinates removes the
+    dependency: with λ = u/v the precision map is already the 2x2 the other
+    combine carries, and η rides in the same coordinates.
+
+    From C = p/a², D = 1 the second coordinate steps as
+
+        v_t = C·u_{t-1} + D·v_{t-1} = den_t·v_{t-1}/a²,
+
+    so the Kalman gain is a ratio of a coordinate the precision scan already
+    carries, α_t = a/den_t = v_{t-1}/(a·v_t). Putting w = v·η the v_t cancels
+    and the whole step is linear::
+
+        [u]   [ A     B     0  ] [u]        A = (1+pφ)/a²    B = φ
+        [v] = [ C     D     0  ] [v]        C = p/a²         D = 1
+        [w]   [r·C   r·D   1/a ] [w]        λ = u/v,  η = w/v
+
+    Lower block-triangular with a scalar (3,3), so composition never forms a
+    full 3x3 product -- ``[[P,0],[q,s]]`` composes as
+
+        P = P₂·P₁,   q = q₂·P₁ + s₂·q₁,   s = s₂·s₁,
+
+    which is the 2x2 product this module already does, plus a 1x2 row and one
+    scalar multiply. The leaf is built from (φ, r, a, p) alone; nothing in it
+    reads λ, which is the entire point.
+
+    **Normalization is load-bearing here in a way it is not for the 2x2.**
+    ``s`` accumulates a⁻ⁿ, which for a decaying filter overflows float32
+    outright -- 7e142 at a=0.5, L=200, unnormalized. Dividing all six entries by
+    the 2x2 block's trace fixes it, and is free for the same reason it is free
+    in :func:`_mobius_combine_tracenorm`: λ = u/v and η = w/v are both invariant
+    under a common rescale of (u, v, w), so the normalizer cancels in the
+    read-out. ∏τ grows faster than a⁻ⁿ, so the normalized ``s`` *decays* to
+    zero, which is the right physics -- the initial η stops mattering. The 2x2
+    block is bounded exactly as it is today, since it is the same block composed
+    the same way. See ``tests/test_merged_algebra.py``, which pins all of this.
+
+    Seven values are carried rather than six: after normalization D = 1 - A, so
+    D is reconstructible, but recovering it costs a subtract at every use and
+    torch has no register pressure to trade it against. The kernels revisit
+    this; here the extra tensor is the cheaper side.
+    """
+    a1, b1, c1, d1, qa1, qb1, s1 = left
+    a2, b2, c2, d2, qa2, qb2, s2 = right
+    a = a2 * a1 + b2 * c1
+    b = a2 * b1 + b2 * d1
+    c = c2 * a1 + d2 * c1
+    d = c2 * b1 + d2 * d1
+    # q = q₂·P₁ + s₂·q₁ -- a 1x2 row through the earlier 2x2, plus the earlier
+    # row scaled by the later (3,3).
+    qa = qa2 * a1 + qb2 * c1 + s2 * qa1
+    qb = qa2 * b1 + qb2 * d1 + s2 * qb1
+    s = s2 * s1
+    inv = 1.0 / (a + d).clamp_min(EPS)
+    return a * inv, b * inv, c * inv, d * inv, qa * inv, qb * inv, s * inv
+
+
+def _merged_leaves(phi, r, a_, p_, a2):
+    """Per-timestep 3x3 leaves (A, B, C, D, qa, qb, s) for :func:`_merged_combine`."""
+    A = ((1.0 + p_ * phi) / a2).expand_as(phi)
+    C = (p_ / a2).expand_as(phi)
+    D = torch.ones_like(phi)
+    return (A, phi, C, D, r * C, r, (1.0 / a_).expand_as(phi))
+
+
+def _merged_readout(prefix, lam0, eta0):
+    """Apply a composed 3x3 prefix to (λ₀, 1, η₀) -> (λ, η).
+
+    The homogeneous vector enters as (u, v, w) = (λ₀, 1, η₀) and leaves as
+    λ = u/v, η = w/v, so the two share one denominator -- the same
+    ``C·λ₀ + D`` the 2x2 read-out already forms.
+    """
+    pA, pB, pC, pD, pQa, pQb, pS = prefix
+    lam0_ = lam0.unsqueeze(1)
+    den = (pC * lam0_ + pD).clamp_min(EPS)
+    lam = (pA * lam0_ + pB) / den
+    eta = (pQa * lam0_ + pQb + pS * eta0.unsqueeze(1)) / den
+    return lam, eta
+
+
 def _affine_combine(left, right):
     """Compose two affine maps x ↦ a·x + b stored as (a, b)."""
     a1, b1 = left
@@ -241,6 +326,7 @@ def kla_scan_torch(
     scan_impl: str = "auto",
     decode_from_prior: bool = False,
     mobius_impl: str = "linear",
+    merged: bool = False,
 ):
     """Parallel-scan torch implementation. Returns (y, y_var, final_state).
 
@@ -264,6 +350,15 @@ def kla_scan_torch(
     inits |a| = 1 so reaching that would take |a| ≳ 440 at Δ=0.1. float64 has
     ~10x the exponent range, so it is a float32-only consideration either way
     and gradcheck is unaffected.
+
+    ``merged=True`` folds the two scans into one, composing the 3x3 map of
+    :func:`_merged_combine` instead of a 2x2 Möbius map followed by an affine
+    one. It is a third value on the fusion axis rather than a third
+    ``mobius_impl``: the map is the same, and it is still composed in linear
+    space with trace normalization -- what changes is that η no longer needs a
+    scan of its own, because its leaf stops depending on λ. ``mobius_impl`` is
+    therefore ignored under ``merged``, as it is under
+    ``scan_impl="sequential"``. See ``docs/implementations.md``.
     """
     v, lambda_v, k, q = _compute_dtype(v, lambda_v, k, q)
     dtype = v.dtype
@@ -299,10 +394,28 @@ def kla_scan_torch(
 
     scan = resolve_scan(scan_impl)
     # The log-space combine takes phi.log(), so it needs the floor; the linear
-    # one does not (see _sufficient_stats).
-    phi, r = _sufficient_stats(v, lambda_v, k, floor=(mobius_impl == "log"))
+    # one does not, and merged never leaves linear space (see _sufficient_stats).
+    phi, r = _sufficient_stats(
+        v, lambda_v, k, floor=(not merged and mobius_impl == "log")
+    )
     a_, p_ = _broadcast_ap(a, p, phi)
     a2 = (a_ * a_).clamp_min(EPS)
+
+    if merged:
+        # One scan for both recurrences: the 3x3 leaf is built from (φ, r, a, p)
+        # alone, so η's leaves no longer wait on the precision scan's λ. See
+        # :func:`_merged_combine`; mobius_impl has nothing to choose between
+        # here, since the merged map is only ever composed in linear space.
+        prefix = scan(_merged_combine, _merged_leaves(phi, r, a_, p_, a2), dim=1)
+        lam, eta = _merged_readout(prefix, lam0, eta0)
+        var = 1.0 / lam.clamp_min(EPS)
+        mean = eta * var
+        if decode_from_prior:
+            mean = a_ * mean
+            var = a2 * var + p_
+        y = torch.einsum("blms,bls->blm", mean, q)
+        y_var = torch.einsum("blms,bls->blm", var, q * q)
+        return y, y_var, KLAState(lam=lam[:, -1], eta=eta[:, -1])
 
     # Precision Möbius scan: λ_t = (Aλ' + B) / (Cλ' + D), with leaf
     # A=(1+pφ)/a², B=φ, C=p/a², D=1. Two representations, same map.
@@ -429,9 +542,11 @@ def kla_scan_reference(
 
 # --------------------------------------------------------------- the registry
 #
-# One entry per implementation, named "<backend>[_unfused]_<implementation>" (see
-# docs/implementations.md). "fused" is the default and carries no token; a bare
-# backend name aliases that backend's default implementation, which is "chunk".
+# One entry per implementation, named
+# "<backend>[_unfused|_merged]_<implementation>" (see docs/implementations.md).
+# "fused" is the default and carries no token; "merged" is fused *and* one scan
+# rather than two. A bare backend name aliases that backend's default
+# implementation.
 #
 # The record carries only what the dispatcher and `python -m kla` actually read.
 # Everything in the contract -- forward, exact backward, state carry, prior
@@ -441,22 +556,33 @@ def kla_scan_reference(
 
 
 class Impl(NamedTuple):
-    """One scan implementation: where it compiles and how it walks time."""
+    """One scan implementation: where it compiles, how it walks time, how fused.
+
+    ``fusion`` is three-valued rather than a flag, because the axis has three
+    positions -- "unfused" materializes ``[B,L,M,S]``, "fused" keeps its
+    intermediates per-chunk, and "merged" does that *and* runs one scan instead
+    of two. torch has no fused cells, so ``torch_merged_*`` reads as "unfused,
+    but one scan"; see docs/implementations.md.
+    """
 
     backend: str  # torch | triton | cuda | mps
     implementation: str  # recurrent | chunk | pscan
-    fused: bool
+    fusion: str  # unfused | fused | merged -- how much is folded together
     max_d_state: Optional[int]  # None = no ceiling
     exact_bwd: bool
     fn: Callable
 
 
-def _torch_scan(scan_impl: str) -> Callable:
+def _torch_scan(scan_impl: str, merged: bool = False) -> Callable:
     """The torch backend at one implementation. `scan_impl` is now internal to it."""
 
     def run(*args, mobius_impl="linear", **kwargs):
         return kla_scan_torch(
-            *args, scan_impl=scan_impl, mobius_impl=mobius_impl, **kwargs
+            *args,
+            scan_impl=scan_impl,
+            mobius_impl=mobius_impl,
+            merged=merged,
+            **kwargs,
         )
 
     return run
@@ -503,48 +629,72 @@ def _mps_scan(name: str) -> Callable:
 _BACKENDS: dict[str, Impl] = {
     # torch -- portable reference, the only one that runs float64
     "torch_unfused_recurrent": Impl(
-        "torch", "recurrent", False, None, True, _torch_scan("sequential")
+        "torch", "recurrent", "unfused", None, True, _torch_scan("sequential")
     ),
     "torch_unfused_chunk": Impl(
-        "torch", "chunk", False, None, True, _torch_scan("chunk")
+        "torch", "chunk", "unfused", None, True, _torch_scan("chunk")
     ),
     "torch_unfused_pscan": Impl(
-        "torch", "pscan", False, None, True, _torch_scan("auto")
+        "torch", "pscan", "unfused", None, True, _torch_scan("auto")
+    ),
+    # torch, merged -- one scan instead of two. torch has no *fused* cells, so
+    # "merged" here means "unfused, but one scan": the single fusion axis cannot
+    # spell both tokens, and unfused is what torch always is. Kept because it is
+    # the only merged cell that runs float64 and can be gradchecked.
+    "torch_merged_chunk": Impl(
+        "torch", "chunk", "merged", None, True, _torch_scan("chunk", merged=True)
+    ),
+    "torch_merged_pscan": Impl(
+        "torch", "pscan", "merged", None, True, _torch_scan("auto", merged=True)
     ),
     # triton
     "triton_recurrent": Impl(
-        "triton", "recurrent", True, None, True, _triton_scan("recurrent")
+        "triton", "recurrent", "fused", None, True, _triton_scan("recurrent")
     ),
-    "triton_chunk": Impl("triton", "chunk", True, None, True, _triton_scan("chunk")),
-    "triton_pscan": Impl("triton", "pscan", True, None, True, _triton_scan("pscan")),
+    "triton_chunk": Impl("triton", "chunk", "fused", None, True, _triton_scan("chunk")),
+    "triton_pscan": Impl("triton", "pscan", "fused", None, True, _triton_scan("pscan")),
     "triton_unfused_recurrent": Impl(
-        "triton", "recurrent", False, None, True, _triton_scan("unfused_recurrent")
+        "triton", "recurrent", "unfused", None, True, _triton_scan("unfused_recurrent")
     ),
     "triton_unfused_chunk": Impl(
-        "triton", "chunk", False, None, True, _triton_scan("unfused_chunk")
+        "triton", "chunk", "unfused", None, True, _triton_scan("unfused_chunk")
     ),
     "triton_unfused_pscan": Impl(
-        "triton", "pscan", False, None, True, _triton_scan("unfused_pscan")
+        "triton", "pscan", "unfused", None, True, _triton_scan("unfused_pscan")
     ),
     # cuda
     "cuda_recurrent": Impl(
-        "cuda", "recurrent", True, 64, True, _cuda_exact("kla_scan_cuda_recurrent")
+        "cuda", "recurrent", "fused", 64, True, _cuda_exact("kla_scan_cuda_recurrent")
     ),
     "cuda_chunk": Impl(
-        "cuda", "chunk", True, 64, True, _cuda_exact("kla_scan_cuda_chunk")
+        "cuda", "chunk", "fused", 64, True, _cuda_exact("kla_scan_cuda_chunk")
     ),
     "cuda_pscan": Impl(
-        "cuda", "pscan", True, 64, True, _cuda_exact("kla_scan_cuda_pscan")
+        "cuda", "pscan", "fused", 64, True, _cuda_exact("kla_scan_cuda_pscan")
     ),
     # prior kernels, kept as the approximate-backward comparison
-    "cuda_v2_2": Impl("cuda", "chunk", True, 64, False, _cuda_scan("v2_2")),
-    "cuda_v2_1": Impl("cuda", "chunk", True, 64, False, _cuda_scan("v2_1")),
+    "cuda_v2_2": Impl("cuda", "chunk", "fused", 64, False, _cuda_scan("v2_2")),
+    "cuda_v2_1": Impl("cuda", "chunk", "fused", 64, False, _cuda_scan("v2_1")),
     # mps
     "mps_recurrent": Impl(
-        "mps", "recurrent", True, 128, True, _mps_scan("kla_scan_mps_recurrent")
+        "mps", "recurrent", "fused", 128, True, _mps_scan("kla_scan_mps_recurrent")
     ),
-    "mps_chunk": Impl("mps", "chunk", True, 128, True, _mps_scan("kla_scan_mps_chunk")),
-    "mps_pscan": Impl("mps", "pscan", True, 128, True, _mps_scan("kla_scan_mps_pscan")),
+    "mps_chunk": Impl(
+        "mps", "chunk", "fused", 128, True, _mps_scan("kla_scan_mps_chunk")
+    ),
+    "mps_pscan": Impl(
+        "mps", "pscan", "fused", 128, True, _mps_scan("kla_scan_mps_pscan")
+    ),
+    # mps, merged -- one scan for both recurrences. `recurrent` has no merged
+    # cell and never will: it *applies* the map rather than composing it, so it
+    # already does λ and η in one pass, and a merged variant would be the same
+    # kernel under a second name.
+    "mps_merged_chunk": Impl(
+        "mps", "chunk", "merged", 128, True, _mps_scan("kla_scan_mps_merged_chunk")
+    ),
+    "mps_merged_pscan": Impl(
+        "mps", "pscan", "merged", 128, True, _mps_scan("kla_scan_mps_merged_pscan")
+    ),
 }
 
 # A bare backend name is that backend's default implementation. `chunk` was the
