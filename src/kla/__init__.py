@@ -33,6 +33,7 @@ __all__ = [
     "KLAState",
     "ModelConfig",
     "SequenceModel",
+    "__version__",
     "backend_names",
     "build_mixer",
     "kla_scan",
@@ -40,5 +41,4 @@ __all__ = [
     "kla_step",
     "register_mixer",
     "resolve_backend",
-    "__version__",
 ]

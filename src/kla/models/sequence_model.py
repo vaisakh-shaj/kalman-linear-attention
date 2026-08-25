@@ -12,7 +12,8 @@ regardless of architecture.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional, Sequence
+from collections.abc import Callable, Sequence
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -150,7 +151,7 @@ class SequenceModel(MarginalReadout, nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        state: Optional[list] = None,
+        state: list | None = None,
         return_state: bool = False,
     ):
         """input_ids [B, L] → logits [B, L, vocab]. Pass/receive per-layer state
@@ -183,14 +184,11 @@ class SequenceModel(MarginalReadout, nn.Module):
         x = self.embedding(input_ids)
         for blk in self.blocks[:-1]:
             x = blk(x)
-        last = self.blocks[-1]
-        mu, var = last.mix(x)
-        self._last_block = last
-        return mu, var
+        return self.blocks[-1].mix(x)
 
     def _head(self, x: torch.Tensor) -> torch.Tensor:
         """Channel mixer + final norm + LM head + softcap, as log-probabilities."""
-        x = self._last_block.channel(x)
+        x = self.blocks[-1].channel(x)
         logits = self.lm_head(self.norm_f(x)).float()
         if self.config.logit_softcap is not None:
             cap = self.config.logit_softcap
@@ -203,7 +201,7 @@ class SequenceModel(MarginalReadout, nn.Module):
         input_ids: torch.Tensor,
         max_new_tokens: int,
         temperature: float = 1.0,
-        top_k: Optional[int] = None,
+        top_k: int | None = None,
     ) -> torch.Tensor:
         """Greedy/temperature sampling with recurrent state (O(1) per token for
         KLA/Mamba mixers, KV cache for attention)."""
@@ -221,7 +219,7 @@ class SequenceModel(MarginalReadout, nn.Module):
 
     @staticmethod
     def _sample(
-        logits: torch.Tensor, temperature: float, top_k: Optional[int]
+        logits: torch.Tensor, temperature: float, top_k: int | None
     ) -> torch.Tensor:
         if temperature <= 0:
             return logits.argmax(dim=-1, keepdim=True)

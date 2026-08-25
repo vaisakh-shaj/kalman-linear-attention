@@ -2,8 +2,8 @@
 
 One triton program owns one ``(batch, channel)`` pair and streams the sequence
 in ``BLOCK_L`` chunks, doing *everything* in registers with no intermediate
-``[B,L,M,S]`` tensor in HBM, round-tripping one of those through HBM is what
-costs an unfused implementation 30-50x at a realistic shape:
+``[B,L,M,S]`` tensor in HBM. Round-tripping one of those through HBM is what
+makes an unfused implementation memory-bound:
 
     load k,q,v·Λ^v,Λ^v  →  φ,r  →  leaves  →  trace-norm Möbius scan → λ
     →  λ_{t-1} by inverting the leaf  →  α  →  affine scan → η
@@ -27,11 +27,11 @@ checkpoints at the same stride, which is all that backward needs.
 
 from __future__ import annotations
 
-import torch
 import triton
 import triton.language as tl
 
-from kla.ops.kernels.triton._tuning import CHUNK_BLOCK_L, warps_for
+from kla.ops.kernels.triton._host import Cell, make_scan
+from kla.ops.kernels.triton._tuning import CHUNK_BLOCK_L
 
 _EPS = tl.constexpr(1e-12)
 
@@ -92,11 +92,10 @@ def _fused_fwd_kernel(
     # Static dynamics are loop-invariant, so hoist them out of the chunk loop.
     a_st = tl.load(a_ptr + m * S + s, mask=s_mask, other=1.0)
     q_st = tl.load(q_ptr + m * S + s, mask=s_mask, other=0.0)
-    # Floored, as every other cell floors it. Unfloored, the leaf A = (1+pφ)/a²
-    # reaches ~1e20 at a = 1e-10, and the scan composes two raw leaves before the
-    # first trace normalization -- A² ~ 1e40 overflows fp32, and the normalizer
-    # then computes inf/inf = NaN. Pinned by
-    # tests/test_backends.py::test_near_zero_decay_stays_finite.
+    # Floored, as every other cell floors it. Unfloored, a near-zero decay sends
+    # the leaf A = (1+pφ)/a² arbitrarily high, and the scan composes two raw
+    # leaves before the first trace normalization -- A² overflows fp32, and the
+    # normalizer then computes inf/inf = NaN.
     a2_st = tl.maximum(a_st * a_st, _EPS)
 
     cA = tl.zeros([BLOCK_S], tl.float32) + 1.0
@@ -182,171 +181,13 @@ def _fused_fwd_kernel(
     tl.store(eta_fin_ptr + (b * M + m) * S + s, c_eta, mask=s_mask)
 
 
-def chunk_forward(
-    msi,
-    si,
-    h,
-    w,
-    a,
-    q,
-    lam0,
-    eta0,
-    checkpoints: bool = False,
-    prior: bool = False,
-    block_l: int = CHUNK_BLOCK_L,
-    num_warps: "int | None" = None,
-):
-    """Fused forward. msi/si [B,L,M], h/w [B,L,S], lam0/eta0 [B,M,S].
+CELL = Cell(
+    kernel=_fused_fwd_kernel,
+    default_block_l=CHUNK_BLOCK_L,
+)
 
-    ``a``/``q`` (decay and process noise) are static ``[M, S]``. Returns
-    ``(y, yvar)`` ``[B,L,M]``, the final ``(lam, eta)``, the permuted
-    ``[B,M,L]`` inputs the backward wants, and the ``[B,M,NCK,S]`` checkpoints.
-    With ``checkpoints=False`` the last two are one-element placeholders, the
-    kernel takes the flag and never writes them.
-    """
-    B, L, M = msi.shape
-    S = h.shape[2]
-
-    msi_t = msi.permute(0, 2, 1).contiguous()  # [B,M,L]
-    si_t = si.permute(0, 2, 1).contiguous()
-    h_c = h.contiguous()
-    w_c = w.contiguous()
-    a_c = a.contiguous()
-    q_c = q.contiguous()
-    lam0_c = lam0.contiguous()
-    eta0_c = eta0.contiguous()
-
-    y = torch.empty(B, M, L, device=msi.device, dtype=torch.float32)
-    yvar = torch.empty(B, M, L, device=msi.device, dtype=torch.float32)
-    lam_fin = torch.empty(B, M, S, device=msi.device, dtype=torch.float32)
-    eta_fin = torch.empty(B, M, S, device=msi.device, dtype=torch.float32)
-
-    n_chunks = triton.cdiv(L, block_l)
-    block_s = triton.next_power_of_2(S)
-    warps = warps_for(block_l, block_s) if num_warps is None else num_warps
-    n_ck = n_chunks if checkpoints else 1
-    ck_shape = (B, M, n_ck, S) if checkpoints else (1,)
-    lam_ck = torch.empty(*ck_shape, device=msi.device, dtype=torch.float32)
-    eta_ck = torch.empty(*ck_shape, device=msi.device, dtype=torch.float32)
-    _fused_fwd_kernel[(B * M,)](
-        msi_t,
-        si_t,
-        h_c,
-        w_c,
-        a_c,
-        q_c,
-        lam0_c,
-        eta0_c,
-        y,
-        yvar,
-        lam_fin,
-        eta_fin,
-        lam_ck,
-        eta_ck,
-        M,
-        L,
-        S,
-        n_chunks,
-        STORE_CK=bool(checkpoints),
-        PRIOR=bool(prior),
-        BLOCK_L=block_l,
-        BLOCK_S=block_s,
-        num_warps=warps,
-    )
-    return (
-        y.permute(0, 2, 1).contiguous(),
-        yvar.permute(0, 2, 1).contiguous(),
-        lam_fin,
-        eta_fin,
-        msi_t,
-        si_t,
-        h_c,
-        w_c,
-        lam0_c,
-        eta0_c,
-        lam_ck,
-        eta_ck,
-    )
-
-
-class _FusedKLAScan(torch.autograd.Function):
-    """The fused triton forward, with the shared triton backward behind it."""
-
-    @staticmethod
-    def forward(ctx, msi, si, h, w, a, q, lam0, eta0, prior, block_l):
-        needs_grad = any(ctx.needs_input_grad)
-        (
-            y,
-            yvar,
-            lam_fin,
-            eta_fin,
-            msi_t,
-            si_t,
-            h_c,
-            w_c,
-            lam0_c,
-            eta0_c,
-            lam_ck,
-            eta_ck,
-        ) = chunk_forward(
-            msi,
-            si,
-            h,
-            w,
-            a,
-            q,
-            lam0,
-            eta0,
-            checkpoints=needs_grad,
-            prior=prior,
-            block_l=block_l,
-        )
-        ctx.prior = prior
-        ctx.block_l = block_l
-        ctx.save_for_backward(
-            msi_t, si_t, h_c, w_c, a, q, lam0_c, eta0_c, lam_ck, eta_ck
-        )
-        return y, yvar, lam_fin, eta_fin
-
-    @staticmethod
-    def backward(ctx, dy, dyvar, dlam_fin, deta_fin):
-        from kla.ops.kernels.triton.kla_scan_bwd import scan_backward
-
-        msi_t, si_t, h_c, w_c, a, q, lam0_c, eta0_c, lam_ck, eta_ck = ctx.saved_tensors
-        dmsi, dsi, dh, dw, da, dp, dlam0, deta0 = scan_backward(
-            dy.permute(0, 2, 1).contiguous(),
-            dyvar.permute(0, 2, 1).contiguous(),
-            dlam_fin.contiguous(),
-            deta_fin.contiguous(),
-            msi_t,
-            si_t,
-            h_c,
-            w_c,
-            a,
-            q,
-            lam0_c,
-            eta0_c,
-            lam_ck,
-            eta_ck,
-            prior=ctx.prior,
-            block_l=ctx.block_l,
-        )
-        return (
-            dmsi.permute(0, 2, 1),
-            dsi.permute(0, 2, 1),
-            dh,
-            dw,
-            da,
-            dp,
-            dlam0,
-            deta0,
-            None,
-            None,
-        )
-
-
-def chunk_kla_scan(
-    msi, si, h, w, a, q, lam0, eta0, prior=False, block_l: int = CHUNK_BLOCK_L
-):
-    """Differentiable fused KLA scan → ``(y, y_var, lam_fin, eta_fin)``."""
-    return _FusedKLAScan.apply(msi, si, h, w, a, q, lam0, eta0, prior, block_l)
+chunk_kla_scan = make_scan(
+    CELL,
+    "chunk_kla_scan",
+    """Differentiable fused KLA scan → ``(y, y_var, lam_fin, eta_fin)``.""",
+)

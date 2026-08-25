@@ -23,7 +23,7 @@
  *     two kla_tile_broadcast calls, which become one broadcast of a float2.
  *   - The per-thread arrays go away. var_h/alpha_h/r_h in kla_chunk_fwd.cuh
  *     exist only to carry phase C's output to D and F -- 3 * ITEMS registers,
- *     24 at ITEMS=8, on a kernel whose whole purpose is occupancy.
+ *     on a kernel whose whole purpose is occupancy.
  *   - Phase C applies both recurrences in the same walk, so it needs alpha_t
  *     only as a local: it has lambda_{t-1} in hand, exactly as the recurrent
  *     kernel does. The composed map never forms alpha at all.

@@ -13,7 +13,7 @@ alongside λ, so there is one ``tl.associative_scan`` where that file runs two.
 Three things follow, and they are the reason this file exists:
 
 - **One scan instead of two.** ``tl.associative_scan`` over ``BLOCK_L`` is
-  ``log2(BLOCK_L)`` rounds of shuffles and predication; halved.
+  ``log2(BLOCK_L)`` rounds of shuffles and predication; that cost is halved.
 - **The λ-inversion trick goes away.** ``chunk_kla_scan`` recovers
   ``λ_{t-1} = (λ_t − φ)/(A − C·λ_t)`` by inverting the leaf, specifically so the
   α-gain needs no cross-chunk λ shift. The merged scan never forms α at all,
@@ -29,10 +29,9 @@ noise* p, not the query.
 
 The backward is :mod:`kla.ops.kernels.triton.kla_scan_bwd`, unchanged and
 unaware, exactly as for the two-scan cells: this forward writes the same
-``[B, M, NCK, S]`` checkpoints at the same stride with the same convention (the
-value *entering* step t), and that backward replays a scalar recurrence from
-them. It never sees a composed map of any size, which is why merging the
-forward cannot touch it.
+``[B, M, NCK, S]`` checkpoints at the same stride and with the same convention
+(the value *entering* step t), and that backward replays a scalar recurrence
+from them, never seeing a composed map of any size.
 
 Transcribed from ``kernels/mps/merged_chunk_kla_scan.metal`` and the algebra in
 ``kernels/mps/kla_merged.metal``; ``kla.ops.kla_ops._merged_combine`` is the
@@ -41,11 +40,11 @@ float64 reference both are checked against.
 
 from __future__ import annotations
 
-import torch
 import triton
 import triton.language as tl
 
-from kla.ops.kernels.triton._tuning import CHUNK_BLOCK_L, warps_for
+from kla.ops.kernels.triton._host import Cell, make_scan
+from kla.ops.kernels.triton._tuning import CHUNK_BLOCK_L
 
 _EPS = tl.constexpr(1e-12)
 
@@ -60,7 +59,7 @@ def _mrg_combine(la, lb, lc, ld, lqa, lqb, ls, ra, rb, rc, rd, rqa, rqb, rs):
     multiply. Dividing all seven by the 2x2 block's trace is free, λ = u/v and
     η = w/v are both invariant under a common rescale of (u,v,w), and it is
     load-bearing: ``s`` accumulates a⁻ⁿ, which overflows fp32 outright for a
-    decaying filter. See ``tests/test_merged_algebra.py``.
+    decaying filter.
     """
     a = ra * la + rb * lc
     b = ra * lb + rb * ld
@@ -199,164 +198,13 @@ def _merged_chunk_fwd_kernel(
     tl.store(eta_fin_ptr + (b * M + m) * S + s, c_eta, mask=s_mask)
 
 
-def merged_chunk_forward(
-    msi,
-    si,
-    h,
-    w,
-    a,
-    q,
-    lam0,
-    eta0,
-    checkpoints: bool = False,
-    prior: bool = False,
-    block_l: int = CHUNK_BLOCK_L,
-    num_warps: "int | None" = None,
-):
-    """Merged fused forward. Same signature and returns as ``chunk_forward``."""
-    B, L, M = msi.shape
-    S = h.shape[2]
+CELL = Cell(
+    kernel=_merged_chunk_fwd_kernel,
+    default_block_l=CHUNK_BLOCK_L,
+)
 
-    msi_t = msi.permute(0, 2, 1).contiguous()  # [B,M,L]
-    si_t = si.permute(0, 2, 1).contiguous()
-    h_c = h.contiguous()
-    w_c = w.contiguous()
-    a_c = a.contiguous()
-    q_c = q.contiguous()
-    lam0_c = lam0.contiguous()
-    eta0_c = eta0.contiguous()
-
-    y = torch.empty(B, M, L, device=msi.device, dtype=torch.float32)
-    yvar = torch.empty(B, M, L, device=msi.device, dtype=torch.float32)
-    lam_fin = torch.empty(B, M, S, device=msi.device, dtype=torch.float32)
-    eta_fin = torch.empty(B, M, S, device=msi.device, dtype=torch.float32)
-
-    n_chunks = triton.cdiv(L, block_l)
-    block_s = triton.next_power_of_2(S)
-    warps = warps_for(block_l, block_s) if num_warps is None else num_warps
-    n_ck = n_chunks if checkpoints else 1
-    ck_shape = (B, M, n_ck, S) if checkpoints else (1,)
-    lam_ck = torch.empty(*ck_shape, device=msi.device, dtype=torch.float32)
-    eta_ck = torch.empty(*ck_shape, device=msi.device, dtype=torch.float32)
-    _merged_chunk_fwd_kernel[(B * M,)](
-        msi_t,
-        si_t,
-        h_c,
-        w_c,
-        a_c,
-        q_c,
-        lam0_c,
-        eta0_c,
-        y,
-        yvar,
-        lam_fin,
-        eta_fin,
-        lam_ck,
-        eta_ck,
-        M,
-        L,
-        S,
-        n_chunks,
-        STORE_CK=bool(checkpoints),
-        PRIOR=bool(prior),
-        BLOCK_L=block_l,
-        BLOCK_S=block_s,
-        num_warps=warps,
-    )
-    return (
-        y.permute(0, 2, 1).contiguous(),
-        yvar.permute(0, 2, 1).contiguous(),
-        lam_fin,
-        eta_fin,
-        msi_t,
-        si_t,
-        h_c,
-        w_c,
-        lam0_c,
-        eta0_c,
-        lam_ck,
-        eta_ck,
-    )
-
-
-class _MergedChunkKLAScan(torch.autograd.Function):
-    """The merged triton forward, with the shared triton backward behind it."""
-
-    @staticmethod
-    def forward(ctx, msi, si, h, w, a, q, lam0, eta0, prior, block_l):
-        needs_grad = any(ctx.needs_input_grad)
-        (
-            y,
-            yvar,
-            lam_fin,
-            eta_fin,
-            msi_t,
-            si_t,
-            h_c,
-            w_c,
-            lam0_c,
-            eta0_c,
-            lam_ck,
-            eta_ck,
-        ) = merged_chunk_forward(
-            msi,
-            si,
-            h,
-            w,
-            a,
-            q,
-            lam0,
-            eta0,
-            checkpoints=needs_grad,
-            prior=prior,
-            block_l=block_l,
-        )
-        ctx.prior = prior
-        ctx.block_l = block_l
-        ctx.save_for_backward(
-            msi_t, si_t, h_c, w_c, a, q, lam0_c, eta0_c, lam_ck, eta_ck
-        )
-        return y, yvar, lam_fin, eta_fin
-
-    @staticmethod
-    def backward(ctx, dy, dyvar, dlam_fin, deta_fin):
-        from kla.ops.kernels.triton.kla_scan_bwd import scan_backward
-
-        msi_t, si_t, h_c, w_c, a, q, lam0_c, eta0_c, lam_ck, eta_ck = ctx.saved_tensors
-        dmsi, dsi, dh, dw, da, dp, dlam0, deta0 = scan_backward(
-            dy.permute(0, 2, 1).contiguous(),
-            dyvar.permute(0, 2, 1).contiguous(),
-            dlam_fin.contiguous(),
-            deta_fin.contiguous(),
-            msi_t,
-            si_t,
-            h_c,
-            w_c,
-            a,
-            q,
-            lam0_c,
-            eta0_c,
-            lam_ck,
-            eta_ck,
-            prior=ctx.prior,
-            block_l=ctx.block_l,
-        )
-        return (
-            dmsi.permute(0, 2, 1),
-            dsi.permute(0, 2, 1),
-            dh,
-            dw,
-            da,
-            dp,
-            dlam0,
-            deta0,
-            None,
-            None,
-        )
-
-
-def merged_chunk_kla_scan(
-    msi, si, h, w, a, q, lam0, eta0, prior=False, block_l: int = CHUNK_BLOCK_L
-):
-    """Differentiable merged fused KLA scan → ``(y, y_var, lam_fin, eta_fin)``."""
-    return _MergedChunkKLAScan.apply(msi, si, h, w, a, q, lam0, eta0, prior, block_l)
+merged_chunk_kla_scan = make_scan(
+    CELL,
+    "merged_chunk_kla_scan",
+    """Differentiable merged fused KLA scan → ``(y, y_var, lam_fin, eta_fin)``.""",
+)

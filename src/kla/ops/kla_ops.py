@@ -34,7 +34,8 @@ back to the working dtype.
 from __future__ import annotations
 
 import functools
-from typing import Callable, NamedTuple, Optional
+from collections.abc import Callable
+from typing import NamedTuple
 
 import torch
 
@@ -74,37 +75,18 @@ def _mobius_combine_log(left, right):
 
 
 def _mobius_combine_tracenorm(left, right):
-    """Compose two 2x2 Möbius matrices in LINEAR space, normalized by the trace.
+    """Compose two 2x2 Möbius matrices in linear space, normalized by the trace.
 
-    The plain-matmul counterpart of :func:`_mobius_combine_log`, and the same
-    scheme the GPU kernels use.
-    Composing the maps is an ordinary 2x2 product; dividing all four entries by
-    the trace afterwards keeps them O(1) without ever leaving linear space.
+    The plain-matmul counterpart of :func:`_mobius_combine_log`, and the scheme
+    every GPU kernel uses. λ is invariant under a common rescale of (A,B,C,D),
+    so dividing by the trace cancels in the read-out and only buys range.
 
-    Rescaling is free because λ is invariant under it: (A,B,C,D) and
-    (kA,kB,kC,kD) define the same map λ ↦ (Aλ+B)/(Cλ+D). So the normalizer
-    cancels in the read-out and only buys numerical range.
-
-    The trace can never vanish *for this matrix family*, which is what makes the
-    scheme safe here rather than merely convenient. Every leaf is entrywise
-    positive -- A=(1+pφ)/a² > 0, B=φ > 0, C=p/a² > 0, D=1 > 0, guaranteed by the
-    clamps on p, φ and a² -- and entrywise-positive 2x2 matrices are closed under
-    multiplication, so every node of the scan tree is positive too. Hence
-    A+D > 0 always, whatever order the associative scan happens to combine in.
-    The ``clamp_min`` below is belt-and-braces, not load-bearing.
-
-    What normalization bounds, precisely: the *diagonal*, since A+D=1 with both
-    positive forces A,D ∈ (0,1). B and C are off-diagonal and are NOT bounded by
-    1 -- they routinely exceed it. What holds for them is a product bound: the
-    leaf determinant is AD-BC = (1+pφ)/a² - φp/a² = 1/a² > 0, determinants are
-    multiplicative, and normalizing divides the determinant by (A+D)² > 0, so
-    det > 0 survives every composition. With A+D=1 we have AD ≤ 1/4, hence
-        B·C = AD - det < 1/4,
-    so B and C cannot both be large -- one grows only as the other shrinks. In
-    practice the composed map converges to a rank-1 projector (det → 0, which is
-    just the filter forgetting its initial condition), and B·C approaches 1/4
-    from below while every entry stays O(1). Empirically the entries reach a
-    fixed point rather than drifting; see tests/test_mobius_impl.py.
+    Safe for *this* matrix family: every leaf is entrywise positive (A=(1+pφ)/a²,
+    B=φ, C=p/a², D=1, given the clamps on p, φ and a²), and positive 2x2 matrices
+    are closed under multiplication, so A+D > 0 at every node whatever order the
+    scan combines in -- the ``clamp_min`` is belt-and-braces. Normalization bounds
+    the diagonal (A+D=1 forces A,D ∈ (0,1)); B and C are bounded only as a
+    product, B·C = AD - det < 1/4, so one grows only as the other shrinks.
     """
     a1, b1, c1, d1 = left
     a2, b2, c2, d2 = right
@@ -138,30 +120,22 @@ def _merged_combine(left, right):
         [v] = [ C     D     0  ] [v]        C = p/a²         D = 1
         [w]   [r·C   r·D   1/a ] [w]        λ = u/v,  η = w/v
 
-    Lower block-triangular with a scalar (3,3), so composition never forms a
-    full 3x3 product -- ``[[P,0],[q,s]]`` composes as
+    Lower block-triangular with a scalar (3,3), so ``[[P,0],[q,s]]`` composes as
+    P = P₂·P₁, q = q₂·P₁ + s₂·q₁, s = s₂·s₁ -- the 2x2 product this module
+    already does, plus a 1x2 row and a scalar multiply. The leaf reads
+    (φ, r, a, p) and never λ, which is the entire point.
 
-        P = P₂·P₁,   q = q₂·P₁ + s₂·q₁,   s = s₂·s₁,
+    **Normalization is load-bearing here in a way it is not for the 2x2**: ``s``
+    accumulates a⁻ⁿ, which overflows float32 outright for a decaying filter over
+    any real sequence length. Dividing all six entries by the 2x2 block's trace
+    is free for the same reason as in :func:`_mobius_combine_tracenorm` -- λ = u/v
+    and η = w/v are invariant under a common rescale of (u, v, w) -- and leaves
+    ``s`` decaying to zero, which is the right physics: the initial η stops
+    mattering.
 
-    which is the 2x2 product this module already does, plus a 1x2 row and one
-    scalar multiply. The leaf is built from (φ, r, a, p) alone; nothing in it
-    reads λ, which is the entire point.
-
-    **Normalization is load-bearing here in a way it is not for the 2x2.**
-    ``s`` accumulates a⁻ⁿ, which for a decaying filter overflows float32
-    outright -- 7e142 at a=0.5, L=200, unnormalized. Dividing all six entries by
-    the 2x2 block's trace fixes it, and is free for the same reason it is free
-    in :func:`_mobius_combine_tracenorm`: λ = u/v and η = w/v are both invariant
-    under a common rescale of (u, v, w), so the normalizer cancels in the
-    read-out. ∏τ grows faster than a⁻ⁿ, so the normalized ``s`` *decays* to
-    zero, which is the right physics -- the initial η stops mattering. The 2x2
-    block is bounded exactly as it is today, since it is the same block composed
-    the same way. See ``tests/test_merged_algebra.py``, which pins all of this.
-
-    Seven values are carried rather than six: after normalization D = 1 - A, so
-    D is reconstructible, but recovering it costs a subtract at every use and
-    torch has no register pressure to trade it against. The kernels revisit
-    this; here the extra tensor is the cheaper side.
+    Seven values are carried rather than six: D = 1 - A after normalization, but
+    recovering it costs a subtract at every use and torch has no register
+    pressure to trade against.
     """
     a1, b1, c1, d1, qa1, qb1, s1 = left
     a2, b2, c2, d2, qa2, qb2, s2 = right
@@ -213,9 +187,8 @@ def _compute_dtype(*tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
 
     The scan is numerically delicate, so bf16/fp16 activations are always
     widened. float64 is *preserved* rather than downcast, which is what lets
-    :func:`torch.autograd.gradcheck` run against these ops (see
-    ``tests/test_gradcheck.py``), the GPU backends are float32-only and cannot
-    be gradchecked.
+    :func:`torch.autograd.gradcheck` run against these ops -- the GPU backends
+    are float32-only.
     """
     return tuple(
         t if t.dtype in (torch.float32, torch.float64) else t.float() for t in tensors
@@ -233,30 +206,16 @@ def _sufficient_stats(v, lambda_v, k, floor: bool = False):
     Information form: φ = Λ^v ⊗ k², r = (v·Λ^v) ⊗ k. The value ``v`` is folded
     into its natural parameter ``v·Λ^v`` here, so raw ``v`` goes no further.
 
-    ``floor`` clamps φ up to EPS. It defaults to OFF; the CUDA kernels apply it
-    unconditionally instead::
+    ``floor`` clamps φ up to EPS, and defaults to OFF. It is two things at once
+    -- a forward floor *and* a gradient mask, since ``clamp_min``'s subgradient
+    is zero wherever it binds -- so it kills gradients into Λ^v and k wherever
+    the key is near zero.
 
-        kla_matmul_scan_ops.cuh    phi = fmaxf(raw_phi, KLA_EPS);
-        kla_matmul_bwd_kernel.cuh  float phi_mask = (raw_phi[i] > KLA_EPS) ...
-
-    Note it is two things there, a forward floor *and* a backward gradient mask
-    -- and ``clamp_min`` reproduces both, since its subgradient is zero wherever
-    it binds. So the floor silently kills gradients into Λ^v and k at every
-    (b,l,m,s) where the key is near zero.
-
-    Dropping it is safe for the linear/trace-normalized Möbius scan (the
-    default), where φ appears only as the leaf B and inside A=(1+pφ)/a², never
-    as log φ. At φ=0 the leaf is [[A,0],[C,1]]: still non-negative, trace still
-    positive, and λ_t = Aλ'/(Cλ'+1) is exactly the right pure-prediction step
-    for an observation carrying no information. The clamp instead injects 1e-12
-    of spurious information *and* drops the gradient.
-
-    It is NOT safe for ``mobius_impl="log"``, which takes ``phi.log()``, so
-    :func:`kla_scan_torch` turns it back on there.
-
-    The fused triton forward keeps its own internal ``tl.maximum(.., 1e-12)``.
-    That path is no-grad, so the masking cannot bite; only the 1e-12 forward
-    difference remains, far below every parity tolerance.
+    Dropping it is safe for the linear Möbius scan (the default), where φ appears
+    only as the leaf B and inside A=(1+pφ)/a², never as log φ: at φ=0 the leaf is
+    [[A,0],[C,1]], the right pure-prediction step for an observation carrying no
+    information. It is NOT safe for ``mobius_impl="log"``, which takes
+    ``phi.log()``, so :func:`kla_scan_torch` turns it back on there.
     """
     phi = lambda_v.unsqueeze(-1) * (k * k).unsqueeze(-2)  # [B,L,M,1]·[B,L,1,S]
     r = (v * lambda_v).unsqueeze(-1) * k.unsqueeze(-2)
@@ -279,27 +238,41 @@ def _recurrent_lambda_eta(phi, r, a, p, lam0, eta0):
         den_t = a² + p·λ_{t-1};  λ_t = λ_{t-1}/den_t + φ_t;
         η_t   = (a/den_t)·η_{t-1} + r_t
 
-    ``torch._higher_order_ops.scan`` carries ``(λ, η)`` along the sequence, so
-    there is no 2×2 matrix, no trace normalization and no prefix-product tensor,
-    about a quarter of the arithmetic of composing, and ``mobius_impl`` has
-    nothing to represent because nothing is composed. It also fuses what the
-    composing path has to do in two passes: the gain α_t reads λ_{t-1}, which a
-    carry already has in hand and an associative scan has to recover afterwards.
+    Carrying ``(λ, η)`` along the sequence means no 2x2 matrix, no trace
+    normalization and no prefix-product tensor -- about a quarter of the
+    arithmetic of composing -- and ``mobius_impl`` has nothing to represent
+    because nothing is composed. It also fuses what the composing path needs two
+    passes for: the gain α_t reads λ_{t-1}, which a carry already has in hand.
 
-    ``a`` and ``p`` are read from the closure. The HOP lifts them as additional
-    inputs and routes gradients back into them, which is what lets the whole
-    recurrence stay one graph node.
+    Two ways through the sequence, and the choice is *only* about correctness.
+    Without grad, ``torch._higher_order_ops.scan`` keeps the whole recurrence in
+    one compiled graph node. Its backward drops the carry chain, though, so
+    under grad it returns silently wrong gradients; the plain loop below runs
+    there instead -- same recurrence, ordinary autograd, one graph node per
+    step. Recheck the HOP against the reference on a torch upgrade before
+    restoring it for the grad path.
     """
-    from torch._higher_order_ops.scan import scan as _scan
-
     a2 = (a * a).clamp_min(EPS)
 
-    def step(carry, x):
-        lam_prev, eta_prev = carry
-        phi_t, r_t = x
+    def step(lam_prev, eta_prev, phi_t, r_t):
         den = (a2 + p * lam_prev).clamp_min(EPS)
-        lam = lam_prev / den + phi_t
-        eta = (a / den) * eta_prev + r_t
+        return lam_prev / den + phi_t, (a / den) * eta_prev + r_t
+
+    if torch.is_grad_enabled() and any(
+        t.requires_grad for t in (phi, r, a, p, lam0, eta0)
+    ):
+        lam_t, eta_t = lam0, eta0
+        lams, etas = [], []
+        for t in range(phi.shape[1]):
+            lam_t, eta_t = step(lam_t, eta_t, phi[:, t], r[:, t])
+            lams.append(lam_t)
+            etas.append(eta_t)
+        return torch.stack(lams, 1), torch.stack(etas, 1), lam_t, eta_t
+
+    from torch._higher_order_ops.scan import scan as _scan
+
+    def hop_step(carry, x):
+        lam, eta = step(*carry, *x)
         # The HOP forbids the carry and the stacked output aliasing.
         return (lam, eta), (lam.clone(), eta.clone())
 
@@ -310,14 +283,10 @@ def _recurrent_lambda_eta(phi, r, a, p, lam0, eta0):
         return torch.empty_like(x, memory_format=torch.contiguous_format).copy_(x)
 
     (lam_fin, eta_fin), (lam, eta) = _scan(
-        step, (dense(lam0), dense(eta0)), (phi.contiguous(), r.contiguous()), dim=1
+        hop_step, (dense(lam0), dense(eta0)), (phi.contiguous(), r.contiguous()), dim=1
     )
-    # The HOP stacks its per-step outputs along dim 0 whatever `dim` was scanned
-    # -- "each tensor leaf is a stacked output along first dim", as its own
-    # docstring puts it. So these come back [L, B, M, S] and the rest of this
-    # module wants [B, L, M, S]. Without the move the read-out einsum contracts
-    # L against B and raises, which is what
-    # tests/test_ops.py::test_parallel_matches_reference[sequential] pins.
+    # The HOP stacks per-step outputs along dim 0 whatever `dim` was scanned, so
+    # these come back [L, B, M, S] and the rest of this module wants [B, L, M, S].
     return lam.movedim(0, 1), eta.movedim(0, 1), lam_fin, eta_fin
 
 
@@ -328,7 +297,7 @@ def kla_scan_torch(
     q: torch.Tensor,
     a: torch.Tensor,
     p: torch.Tensor,
-    initial_state: Optional[KLAState] = None,
+    initial_state: KLAState | None = None,
     scan_impl: str = "auto",
     decode_from_prior: bool = False,
     mobius_impl: str = "linear",
@@ -344,27 +313,22 @@ def kla_scan_torch(
 
     ``mobius_impl="linear"`` (default) composes the 2x2 maps as plain matmuls
     normalized by the trace -- no transcendentals in the combine, and the same
-    scheme both GPU backends use, so torch is now a faithful reference for them
+    scheme both GPU backends use, so torch is a faithful reference for them
     rather than a second opinion computed a different way.
 
     ``mobius_impl="log"`` keeps the entries as logs and combines with
-    ``logaddexp``. It is kept as a reference implementation of the same map,
-    showing how else the composition can be done -- not as a fallback, since
-    trace normalization is stable on its own. The one place the two differ at
-    all is extreme decay: after trace-normalization D ≈ a²/(1+pφ), which
-    underflows float32 once ā drops below ~1e-19 (Δ·|a| ≳ 44), and the layer
-    inits |a| = 1 so reaching that would take |a| ≳ 440 at Δ=0.1. float64 has
-    ~10x the exponent range, so it is a float32-only consideration either way
-    and gradcheck is unaffected.
+    ``logaddexp`` -- a reference implementation of the same map, not a fallback,
+    since trace normalization is stable on its own. Log space buys exponent
+    headroom the linear combine only needs under decay far stronger than any
+    initialization the layer produces.
 
     ``merged=True`` folds the two scans into one, composing the 3x3 map of
-    :func:`_merged_combine` instead of a 2x2 Möbius map followed by an affine
-    one. It is a third value on the fusion axis rather than a third
-    ``mobius_impl``: the map is the same, and it is still composed in linear
-    space with trace normalization -- what changes is that η no longer needs a
-    scan of its own, because its leaf stops depending on λ. ``mobius_impl`` is
-    therefore ignored under ``merged``, as it is under
-    ``scan_impl="sequential"``. See ``docs/implementations.md``.
+    :func:`_merged_combine` rather than a 2x2 Möbius map followed by an affine
+    one. It is a third value on the fusion axis, not a third ``mobius_impl``:
+    same map, still composed in linear space, but η's leaf stops depending on λ
+    so it needs no scan of its own. ``mobius_impl`` is therefore ignored under
+    ``merged``, as it is under ``scan_impl="sequential"``.
+    See ``docs/implementations.md``.
     """
     v, lambda_v, k, q = _compute_dtype(v, lambda_v, k, q)
     dtype = v.dtype
@@ -409,7 +373,7 @@ def kla_scan_torch(
 
     if merged:
         # One scan for both recurrences: the 3x3 leaf is built from (φ, r, a, p)
-        # alone, so η's leaves no longer wait on the precision scan's λ. See
+        # alone, so η's leaves do not wait on the precision scan's λ. See
         # :func:`_merged_combine`; mobius_impl has nothing to choose between
         # here, since the merged map is only ever composed in linear space.
         prefix = scan(_merged_combine, _merged_leaves(phi, r, a_, p_, a2), dim=1)
@@ -522,7 +486,7 @@ def kla_scan_reference(
     q,
     a,
     p,
-    initial_state: Optional[KLAState] = None,
+    initial_state: KLAState | None = None,
     decode_from_prior: bool = False,
 ):
     """Sequential reference: applies :func:`kla_step` along the sequence."""
@@ -553,9 +517,9 @@ def kla_scan_reference(
 # "fused" is the default and carries no token; "merged" is fused *and* one scan
 # rather than two. A bare backend name aliases that backend's default.
 #
-# The record carries only what the dispatcher and `python -m kla` actually read.
-# Everything in the contract -- forward, *exact* backward, state carry, prior
-# decode, fp32 -- is required of every cell, so none of it is a per-cell flag.
+# The record carries only what the dispatcher and `python -m kla` actually read:
+# forward, *exact* backward, state carry, prior decode and fp32 are required of
+# every cell, so none of them is a per-cell flag.
 
 
 class Impl(NamedTuple):
@@ -571,12 +535,12 @@ class Impl(NamedTuple):
     backend: str  # torch | triton | cuda | mps
     implementation: str  # recurrent | chunk
     fusion: str  # unfused | fused | merged -- how much is folded together
-    max_d_state: Optional[int]  # None = no ceiling
+    max_d_state: int | None  # None = no ceiling
     fn: Callable
 
 
 def _torch_scan(scan_impl: str, merged: bool = False) -> Callable:
-    """The torch backend at one implementation. `scan_impl` is now internal to it."""
+    """The torch backend at one implementation; `scan_impl` is internal to it."""
 
     def run(*args, mobius_impl="linear", **kwargs):
         return kla_scan_torch(
@@ -619,10 +583,9 @@ def _mps_scan(name: str) -> Callable:
 
 _BACKENDS: dict[str, Impl] = {
     # torch -- portable reference, the only backend that runs float64. It has no
-    # *fused* cells, so "merged" here reads as "unfused, but one scan": the
-    # single fusion axis cannot spell both tokens, and unfused is what torch
-    # always is. That cell is what lets the merged algebra be gradchecked
-    # against finite differences rather than against another fp32 kernel.
+    # *fused* cells, so "merged" here reads as "unfused, but one scan", and that
+    # cell is what lets the merged algebra be gradchecked against finite
+    # differences rather than against another fp32 kernel.
     "torch_unfused_recurrent": Impl(
         "torch", "recurrent", "unfused", None, _torch_scan("sequential")
     ),
@@ -662,15 +625,10 @@ _BACKENDS: dict[str, Impl] = {
     ),
 }
 
-# A bare backend name is that backend's default implementation, and all four are
-# measured rather than assumed. torch and mps take `recurrent`, which won every
-# shape either is realistically used at (docs/benchmarks/mps.md). triton and cuda
-# take `chunk`: on an L40S `recurrent` is latency-bound on its serial chain and
-# flat from 256 lanes to 65536, so the crossover that put mps on `recurrent` sits
-# two orders of magnitude further out. Between the two chunk cells, triton takes
-# the *merged* one -- it beat the two-scan cell at every shape measured and never
-# lost -- and cuda does not, because there merging costs 3-29% instead of saving.
-# Same algebra, opposite verdicts; see docs/benchmarks/cuda.md.
+# A bare backend name is that backend's default implementation. Which cell wins
+# is a property of the device, not of the algebra, so each of these is picked by
+# measurement rather than by argument; see docs/benchmarks/. Re-measure before
+# changing one.
 _ALIASES = {
     "torch": "torch_unfused_recurrent",
     "triton": "triton_merged_chunk",
@@ -698,8 +656,8 @@ def _mps_available() -> bool:
 
 
 # Device -> the backend "auto" picks there, if its kernels are importable. `cuda`
-# is deliberately absent even though it is 1.2-2x triton on the same algebra: it
-# needs nvcc and a matching C++ toolchain at first use, which "auto" cannot
+# is deliberately absent despite being the faster of the two on the same algebra:
+# it needs nvcc and a matching C++ toolchain at first use, which "auto" cannot
 # assume. Pin backend="cuda" to get it.
 _AUTO = (
     ("is_cuda", "triton", _triton_available),
@@ -707,7 +665,7 @@ _AUTO = (
 )
 
 
-def resolve_impl(name: str, x: Optional[torch.Tensor] = None) -> str:
+def resolve_impl(name: str, x: torch.Tensor | None = None) -> str:
     """Resolve ``"auto"`` and bare backend names to one implementation name."""
     if name == "auto":
         if x is None:
@@ -727,7 +685,7 @@ def kla_scan(
     a: torch.Tensor,
     p: torch.Tensor,
     *,
-    initial_state: Optional[KLAState] = None,
+    initial_state: KLAState | None = None,
     backend: str = "auto",
     decode_from_prior: bool = False,
     mobius_impl: str = "linear",
@@ -753,7 +711,7 @@ def kla_scan(
         ) from None
 
     S = k.shape[2]
-    if impl.max_d_state is not None and S > impl.max_d_state:
+    if impl.max_d_state is not None and impl.max_d_state < S:
         raise NotImplementedError(
             f"{name} supports d_state <= {impl.max_d_state} (got {S}); "
             "use backend='torch', which has no ceiling."

@@ -46,9 +46,8 @@ def marginal_logprobs(
     softmax to it again would be a bug.
 
     Peak memory is ``S`` times the head's output, so an ``S x B x L x vocab``
-    tensor at its widest. That is a few MB at MAD sizes and a few hundred at
-    long-context ones; if it ever binds, evaluate in sequence chunks rather than
-    reintroducing a sample loop.
+    tensor at its widest. If that ever binds, evaluate in sequence chunks rather
+    than reintroducing a sample loop.
     """
     if var is None:
         raise ValueError(
@@ -72,8 +71,8 @@ class MarginalReadout:
 
         Both read-outs come from ONE trunk evaluation, so they are scored on
         identical weights and an identical scan. Running them as separate jobs
-        would let kernel nondeterminism (measured at up to 0.047 accuracy on
-        selective copying) swamp the decoding effect being measured.
+        would let kernel nondeterminism swamp the decoding effect being measured,
+        which is typically the smaller of the two.
 
         Deliberately not wrapped in ``no_grad``: evaluation already runs inside
         one, while a multi-sample *training* loss needs the reparametrised

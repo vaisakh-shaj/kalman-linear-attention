@@ -35,19 +35,18 @@
  * the arithmetic is a wash and the win is structural.
  *
  * NORMALIZATION IS LOAD-BEARING HERE, more so than for the 2x2. The (3,3) entry
- * accumulates a^-n, which overflows float32 outright for a decaying filter
- * (7e142 at a=0.5 over 200 steps, measured). Dividing all seven entries by the
+ * accumulates a^-n, which overflows float32 outright for a decaying filter over
+ * any real sequence length. Dividing all seven entries by the
  * 2x2 block's trace fixes it and is free, because lambda = u/v and eta = w/v are
  * both invariant under a common rescale of (u,v,w). The product of traces grows
  * faster than a^-n, so the normalized s *decays* to zero -- which is the right
- * physics: the initial eta stops mattering. tests/test_merged_algebra.py pins
- * all of this, including the overflow, in torch and float64.
+ * physics: the initial eta stops mattering.
  *
  * Seven values are carried, not six. After a compose D = 1 - A, so D looks
  * redundant -- but D is the small entry (roughly a^2/(1+p.phi)), and recovering
  * it as 1 - A gives it an absolute error of one ulp of A, which is a *relative*
- * error of eps/D: 2.7e-4 against 5.0e-7 in the entry lambda is most sensitive
- * to, measured, to save four bytes. The eighth slot is padding, so the
+ * error of eps/D in the entry lambda is most sensitive to. Not worth four
+ * bytes. The eighth slot is padding, so the
  * aggregate is two 16-byte vector accesses rather than seven scalar ones; a
  * [...,7] element would stride every thread's read across the vector width.
  ******************************************************************************/

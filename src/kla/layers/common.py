@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -34,8 +36,6 @@ def inv_softplus_dt_init(
     dt_init_floor: float,
 ) -> torch.Tensor:
     """Mamba-style Δ init: log-uniform in [dt_min, dt_max], stored pre-softplus."""
-    import math
-
     dt = torch.exp(
         torch.rand(*shape) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
     ).clamp_min(dt_init_floor)

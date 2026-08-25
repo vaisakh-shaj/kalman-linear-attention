@@ -10,24 +10,20 @@ prebuilt binaries.
 
 ``cuda_fused_recurrent``
     One thread per ``(batch, channel, state)`` lane, time serial, the Möbius map
-    *applied* to a running λ. Its whole grid is the lane count, so it wants a lot
-    of lanes, but on a 142-SM L40S its serial chain of divisions is
-    latency-bound rather than throughput-bound, and its time is flat from 256
-    lanes to 65536. That makes it the fastest cell only past ~64k lanes with a
-    short sequence, and in training at a realistic shape.
+    *applied* to a running λ. Its whole grid is the lane count, so it needs many
+    lanes to fill the device; its serial chain of divisions is latency-bound
+    rather than throughput-bound, which is what limits it at narrow shapes.
 ``cuda_fused_chunk`` (``backend="cuda"``)
     Time tiled: ``KLA_ITEMS`` timesteps per thread, composed within a CUB block
-    scan and carried across chunks. Fastest or within 3% at every shape measured
-    on an L40S, which is why the bare alias points here.
+    scan and carried across chunks. The bare alias points here.
 ``cuda_merged_chunk``
-    ``cuda_fused_chunk`` with both recurrences folded into one 3x3 map in homogeneous
-    coordinates (``kla_merged.cuh``), so the block scans once instead of twice.
-    **It is the merged cell that costs rather than saves**, 3-29% slower than
-    ``cuda_fused_chunk`` at every shape, because CUDA's second scan is only
-    ``log2(ROWS)`` rounds of ``float2`` shuffles and merging widens the shared
-    memory aggregate to pay for them. The identical transcription *wins* on
-    triton and mps, where the second scan was expensive. Kept as the measured
-    counterexample; see ``docs/benchmarks/cuda.md``.
+    ``cuda_fused_chunk`` with both recurrences folded into one 3x3 map in
+    homogeneous coordinates (``kla_merged.cuh``), so the block scans once instead
+    of twice. **Here merging costs rather than saves**: CUDA's second scan is
+    only ``log2(ROWS)`` rounds of ``float2`` shuffles, and merging widens the
+    shared-memory aggregate to pay for them. The identical transcription wins on
+    triton and mps, where the second scan is expensive -- so the merged algebra
+    is worth having on every backend, but not worth defaulting to on this one.
 
 Every cell is exact in the backward, carries the filter state in and out
 differentiably, and supports ``decode_from_prior``. The backward differentiates
@@ -44,25 +40,22 @@ All layer-level features (projections, conv, qk-norm, discretization to
 ``a``/``p``, gating, λ-skip, variance read-out) are applied in PyTorch around
 this scan, so these are drop-ins for :func:`kla.ops.kla_scan_torch`.
 
-``backend="auto"`` prefers triton on CUDA rather than this backend, even though
-these kernels are 1.2-2x faster on the same algebra: they need nvcc and a
+``backend="auto"`` prefers triton on CUDA rather than this backend, despite these
+kernels being the faster of the two on the same algebra: they need nvcc and a
 matching C++ toolchain at first use, which ``auto`` cannot assume. Pin
 ``backend="cuda"`` to get them.
 
 Build toolchain
 ---------------
-The kernels must be compiled with a CUDA toolkit matching the installed torch
-(CUDA 13 for the ``cu13x`` wheels; nvcc 12.9 is the wrong major version). That
-toolchain is *not* a project dependency, the ``nvidia-cuda-nvcc-cu13`` /
-``nvidia-cuda-cccl-cu13`` pip packages have no py3.14 wheels and don't belong in
-the runtime lockfile. Provision it out-of-band (a py<=3.13 sidecar venv, or an
-existing toolkit) and point ``CUDA_HOME`` (or ``KLA_CUDA_HOME``) at a tree with
-``bin/nvcc`` + the cub/cccl headers + ``lib64/libcudart.so`` (``ninja`` must
-also be importable, it drives the cpp_extension build). Set
-``KLA_JIT_VERBOSE=1`` to see the build command line. torch already ships the
-cu13 cudart + cusparse/cublas redist headers under ``site-packages/nvidia/*``,
-and :func:`_load_scan_extension` adds every one of them to the include path
-automatically, so a minimal nvcc+cccl toolkit is enough.
+The kernels need a CUDA toolkit whose major version matches the installed torch
+(CUDA 13 for the ``cu13x`` wheels). It is deliberately *not* a project
+dependency: provision it out-of-band and point ``CUDA_HOME`` (or
+``KLA_CUDA_HOME``) at a tree with ``bin/nvcc``, the cub/cccl headers and
+``lib64/libcudart.so``; ``ninja`` must be importable too, it drives the
+cpp_extension build. A minimal nvcc+cccl toolkit is enough --
+:func:`_load_scan_extension` adds torch's own bundled redist headers under
+``site-packages/nvidia/*`` to the include path. ``KLA_JIT_VERBOSE=1`` shows the
+build command line.
 
 A killed build leaves a lock behind that hangs every later process with no
 message: ``find ~/.cache/torch_extensions -name lock -delete``.
@@ -73,7 +66,6 @@ from __future__ import annotations
 import functools
 import glob
 import os
-from typing import Optional
 
 import torch
 
@@ -104,7 +96,7 @@ MAX_DSTATE = 64
 channel, because the read-out sums over the state axis."""
 
 
-def _unsupported(msg: str) -> "NotImplementedError":
+def _unsupported(msg: str) -> NotImplementedError:
     return NotImplementedError(
         f"The CUDA KLA backend {msg}. Use backend='torch' or 'triton' for this case."
     )
@@ -121,8 +113,8 @@ def _tuning_flags() -> tuple[list[str], str]:
     Both are guarded with ``#ifndef`` in ``kla_scan_common.cuh``; setting
     ``KLA_CUDA_CHUNK`` / ``KLA_CUDA_ITEMS`` in the environment passes them
     through as ``-D`` and gives the build its own extension name, so several
-    settings can be measured without clobbering each other's cache. Unset means
-    the defaults compiled into the header, and the plain extension name.
+    settings can be measured without clobbering each other's build cache. Unset
+    means the defaults compiled into the header, and the plain extension name.
     """
     flags, parts = [], []
     pairs = (("KLA_CUDA_CHUNK", "KLA_CHUNK"), ("KLA_CUDA_ITEMS", "KLA_ITEMS"))
@@ -156,9 +148,8 @@ def _load_scan_extension():
     from torch.utils.cpp_extension import load
 
     site = os.path.dirname(os.path.dirname(torch.__file__))
-    includes = [_SCAN_DIR] + sorted(
-        glob.glob(os.path.join(site, "nvidia", "*", "include"))
-    )
+    nvidia = sorted(glob.glob(os.path.join(site, "nvidia", "*", "include")))
+    includes = [_SCAN_DIR, *nvidia]
     tune_flags, suffix = _tuning_flags()
     return load(
         name=f"kla_scan_cuda{suffix}",
@@ -218,7 +209,7 @@ def _cuda_scan(implementation: str):
         q: torch.Tensor,
         a: torch.Tensor,
         p: torch.Tensor,
-        initial_state: Optional[KLAState] = None,
+        initial_state: KLAState | None = None,
         decode_from_prior: bool = False,
     ):
         if not v.is_cuda:

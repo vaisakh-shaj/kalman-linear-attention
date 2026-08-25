@@ -13,8 +13,8 @@
  * through a chain of 4x4 Jacobians, ~64 MACs and 16 floats of shared memory per
  * thread per step. The composed matrix degenerates toward rank-1, so that carry
  * is ill-conditioned in float32 even though the forward -- a scale-invariant
- * ratio of the same matrix -- is not; measured against a float64 reference it
- * comes out 5-15% wrong on the gradients that flow through the precision scan.
+ * ratio of the same matrix -- is not, and the gradients that flow through the
+ * precision scan come out visibly wrong against a float64 reference.
  * Differentiating the *recurrence* instead gives a scalar gain
  *
  *     d lambda_t / d lambda_{t-1} = a^2/den_t^2

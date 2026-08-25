@@ -84,7 +84,7 @@ def test_gradients_match_reference(device):
     y_r, v_r, _ = kla_scan_reference(*inputs_r)
     (y_p.square().sum() + v_p.sum()).backward()
     (y_r.square().sum() + v_r.sum()).backward()
-    for g_p, g_r in zip(inputs_p, inputs_r):
+    for g_p, g_r in zip(inputs_p, inputs_r, strict=True):
         torch.testing.assert_close(g_p.grad, g_r.grad, atol=2e-3, rtol=1e-3)
 
 
@@ -112,7 +112,7 @@ def test_triton_backend_matches_reference():
     torch.testing.assert_close(s.lam, s_r.lam, atol=1e-3, rtol=1e-4)
     (y.square().sum() + v.sum()).backward()
     (y_r.square().sum() + v_r.sum()).backward()
-    for g, g_r in zip(inputs, inputs_r):
+    for g, g_r in zip(inputs, inputs_r, strict=True):
         torch.testing.assert_close(g.grad, g_r.grad, atol=1e-2, rtol=1e-2)
 
 

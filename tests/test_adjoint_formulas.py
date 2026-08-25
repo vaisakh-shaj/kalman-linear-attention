@@ -174,7 +174,9 @@ def test_adjoint_matches_autograd(prior, L):
     torch.autograd.backward([y, yv, lam_fin, eta_fin], seeds)
 
     got = _manual_bwd(*[t.detach() for t in args], *seeds, prior)
-    for name, g, t in zip("msi si k q a p lam0 eta0".split(), got, args):
+    for name, g, t in zip(
+        ["msi", "si", "k", "q", "a", "p", "lam0", "eta0"], got, args, strict=True
+    ):
         scale = t.grad.abs().max().item() + 1e-9
         err = (g - t.grad).abs().max().item() / scale
         assert err < 1e-10, f"d{name} off by {err:.2e}"
@@ -373,6 +375,8 @@ def test_checkpointed_replay_matches_autograd(prior, L):
     torch.autograd.backward([y, yv, lam_fin, eta_fin], seeds)
 
     got = _checkpointed_bwd(*[t.detach() for t in args], *seeds, prior)
-    for name, g, t in zip("msi si k q a p lam0 eta0".split(), got, args):
+    for name, g, t in zip(
+        ["msi", "si", "k", "q", "a", "p", "lam0", "eta0"], got, args, strict=True
+    ):
         err = (g - t.grad).abs().max().item() / (t.grad.abs().max().item() + 1e-9)
         assert err < 1e-10, f"L={L} prior={prior}: d{name} off by {err:.2e}"

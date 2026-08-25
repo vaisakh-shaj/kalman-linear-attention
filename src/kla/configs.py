@@ -8,7 +8,7 @@ expose the full ablation space on the command line without any changes here.
 from __future__ import annotations
 
 import dataclasses
-from typing import Literal, Optional, Union
+from typing import Literal
 
 # Implementations are named "<backend>[_unfused|_merged]_<implementation>",
 # where the implementation is how the kernel gets through the sequence --
@@ -46,13 +46,12 @@ MobiusImpl = Literal["linear", "log"]
 # How a d_inner-wide sensor signal is produced from the post-conv stream z.
 #   "full"  one Linear(M, M): no bottleneck. The published architecture.
 #   "dt"    low rank M -> r -> M, r = dt_rank or ceil(d_model/8). Named after
-#           Mamba's dt_proj, which occupies the same slot (Delta is the only
-#           d_inner-wide control signal Mamba has); the rank is twice Mamba's
-#           own ceil(d_model/16), since sigma^2_v carries more than a timescale.
+#           Mamba's dt_proj, which occupies the same slot; the rank is wider
+#           than Mamba's, since sigma^2_v carries more than a timescale.
 #   int     that rank explicitly. Only *saves* when 2*rank < d_inner.
 #   "conv"  (value only) v = z, no projection at all. Mamba's move.
-Rank = Union[int, Literal["full", "dt"]]
-ValueRank = Union[int, Literal["full", "dt", "conv"]]
+Rank = int | Literal["full", "dt"]
+ValueRank = int | Literal["full", "dt", "conv"]
 
 
 @dataclasses.dataclass
@@ -90,7 +89,7 @@ class KLAConfig:
 
     # --- process / observation noise --------------------------------------
     process_noise_scale: float = 0.01
-    """Initial scale of the continuous process noise; 0.01 works best empirically."""
+    """Initial scale of the continuous process noise."""
 
     learnable_process_noise: bool = True
     """If True the process noise is a trained parameter, otherwise a fixed buffer."""
@@ -101,7 +100,7 @@ class KLAConfig:
     obs_var_min: float = 1e-4
     """Floor added to the predicted observation variance (softplus(log_var) + floor)."""
 
-    obs_var_max: Optional[float] = None
+    obs_var_max: float | None = None
     """Optional clamp on the predicted observation variance."""
 
     # --- sensor path shape: the "plain" and "mamba" blocks -----------------
@@ -136,10 +135,9 @@ class KLAConfig:
     and genuinely low-dimensional, and it is exactly what Mamba does to Delta.
 
     NOTE a rank only *saves* when 2*rank < d_inner, because the bottleneck costs
-    two projections where the full map costs one. At d_inner=256 a rank of 256
-    therefore costs *twice* the full projection rather than less, which is how
-    the two static variants come out the same size at the MAD setting. Solve for
-    the rank against a parameter budget rather than picking one by eye."""
+    two projections where the full map costs one -- a rank equal to d_inner costs
+    twice the full projection rather than less. Solve for the rank against a
+    parameter budget rather than picking one by eye."""
 
     # --- projections / normalization --------------------------------------
     qk_norm: bool = True
@@ -184,12 +182,12 @@ class KLAConfig:
     decode_from_prior: bool = False
     """Output the one-step-ahead prior prediction instead of the filtered posterior."""
 
-    dt_rank: Optional[int] = None
+    dt_rank: int | None = None
     """Rank used by the ``"dt"`` setting of ``value_rank`` / ``var_rank``
     (named after Mamba's dt_rank). None = ceil(d_model / 8)."""
 
     # --- numerics ----------------------------------------------------------
-    clip_value: Optional[float] = None
+    clip_value: float | None = None
     """Optional symmetric clamp on h/w projections (and max clamp on process noise)."""
 
     # --- hardware / speed tricks -------------------------------------------
@@ -213,14 +211,12 @@ class KLAConfig:
               trace. No transcendentals in the combine, and the same scheme both
               GPU backends use -- so torch is a faithful reference for them.
     "log"     keep the entries as logs and combine with logaddexp. Slower, but
-              strictly more exponent headroom: after trace-normalization
-              D ~ a²/(1+pφ), which underflows float32 once ā drops below ~1e-19.
+              strictly more exponent headroom.
 
-    Trace normalization is stable on its own -- the defaults init |a| = 1, and
-    reaching that underflow would take |a| ≳ 440 at Δ=0.1 -- so "linear" is the
-    one to use. "log" is kept as a reference implementation of the same map, to
-    show how else the Möbius scan can be composed.
-    See :func:`kla.ops.kla_scan_torch`."""
+    Trace normalization is stable across any decay the layer's initialization
+    produces, so "linear" is the one to use; "log" is kept as a reference
+    implementation of the same map, to show how else the Möbius scan can be
+    composed. See :func:`kla.ops.kla_scan_torch`."""
 
     checkpoint_ssm: bool = False
     """Recompute the SSM scan in backward (activation checkpointing) to save memory."""
@@ -238,11 +234,11 @@ class ModelConfig:
     n_layers: int = 6
 
     mlp: Literal["none", "swiglu", "gelu"] = "swiglu"
-    """Channel mixer interleaved after each sequence mixer. "none" = mixer-only stack
-    (the original MAD setups alternate mixer/swiglu)."""
+    """Channel mixer interleaved after each sequence mixer. "none" = mixer-only
+    stack."""
 
     mlp_ratio: float = 4.0
     norm_eps: float = 1e-5
     tie_embeddings: bool = False
-    logit_softcap: Optional[float] = None
-    """Optional tanh soft-capping of the output logits (as used in nanochat)."""
+    logit_softcap: float | None = None
+    """Optional tanh soft-capping of the output logits."""

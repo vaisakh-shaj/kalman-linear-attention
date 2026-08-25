@@ -312,7 +312,7 @@ def scan_backward(
     eta_ck,
     prior: bool = False,
     block_l: int = CHUNK_BLOCK_L,
-    num_warps: "int | None" = None,
+    num_warps: int | None = None,
 ):
     """The shared triton backward.
 

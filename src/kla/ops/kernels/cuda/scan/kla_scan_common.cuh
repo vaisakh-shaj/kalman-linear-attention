@@ -31,12 +31,12 @@
 // The two tuning constants. Guarded so a build can override them with -D
 // without editing this file: kla.ops.cuda_backend reads KLA_CUDA_CHUNK and
 // KLA_CUDA_ITEMS from the environment and passes them through, which is what
-// drives the sweeps behind docs/benchmarks/cuda.md. The defaults below are the
-// values that sweep settled on: KLA_ITEMS=8 was already optimal, and KLA_CHUNK
-// is 8 because the register pressure in the backward's replay buffers wants it
-// there. It sat at 16 only as a compromise with cuda_pscan, which wanted 64 for
-// its aggregate bandwidth; with that cell gone the compromise went with it and
-// this is worth ~5% on a whole-layer training step, for twice the checkpoints.
+// drives the sweeps behind docs/benchmarks/cuda.md. The defaults below are what
+// that sweep settled on. Unlike triton, which has to use one number for both,
+// these two are independent: KLA_ITEMS is the forward's tile depth, and
+// KLA_CHUNK is the checkpoint stride, held down by the register pressure of the
+// backward's replay buffers at the cost of more checkpoints. Re-sweep rather
+// than reasoning about either.
 #ifndef KLA_CHUNK
 #define KLA_CHUNK 8   // checkpoint stride; also the replay buffers' depth
 #endif

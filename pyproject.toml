@@ -59,7 +59,16 @@ markers = ["slow: finite-difference gradchecks; deselect with -m 'not slow'"]
 line-length = 88
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "W"]
+select = ["E", "F", "I", "W", "UP", "B", "SIM", "PIE", "PERF", "RUF"]
+ignore = [
+    # The docstrings are full of the paper's notation (Λ, λ, ×, −), which these
+    # rules read as homoglyphs of ASCII.
+    "RUF001",
+    "RUF002",
+    "RUF003",
+    # `B, L, M = x.shape` documents the shape even where a name goes unused.
+    "RUF059",
+]
 
 [tool.uv]
 default-groups = ["dev"]

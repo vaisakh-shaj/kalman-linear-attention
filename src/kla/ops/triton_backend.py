@@ -21,15 +21,12 @@ trace, which keeps entries O(1) without log-space since λ is scale-invariant.
 The information vector η_t = α_t·η' + r_t is a plain affine scan. Both adjoints
 are scalar, which is what makes every cell here exact.
 
-``backend="triton"`` resolves to ``triton_merged_chunk``, which beat the
-two-scan cell at every shape measured on an L40S and never lost, and
-``backend="auto"`` already prefers triton on CUDA. See
+``backend="triton"`` resolves to ``triton_merged_chunk``, the faster of the two
+chunk cells here, and ``backend="auto"`` already prefers triton on CUDA. See
 ``docs/benchmarks/cuda.md``.
 """
 
 from __future__ import annotations
-
-from typing import Optional
 
 import torch
 
@@ -69,7 +66,7 @@ def kla_scan_triton(
     q: torch.Tensor,
     a: torch.Tensor,
     p: torch.Tensor,
-    initial_state: Optional[KLAState] = None,
+    initial_state: KLAState | None = None,
     decode_from_prior: bool = False,
     kernel: str = "merged_chunk",
 ):

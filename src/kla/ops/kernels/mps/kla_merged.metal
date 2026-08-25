@@ -31,13 +31,12 @@
  * the arithmetic is a wash and the win is structural.
  *
  * NORMALIZATION IS LOAD-BEARING HERE, more so than for the 2x2. The (3,3) entry
- * accumulates a^-n, which overflows float32 outright for a decaying filter
- * (7e142 at a=0.5 over 200 steps, measured). Dividing all seven entries by the
+ * accumulates a^-n, which overflows float32 outright for a decaying filter over
+ * any real sequence length. Dividing all seven entries by the
  * 2x2 block's trace fixes it and is free, because lambda = u/v and eta = w/v are
  * both invariant under a common rescale of (u,v,w). The product of traces grows
  * faster than a^-n, so the normalized s *decays* to zero -- which is the right
- * physics: the initial eta stops mattering. tests/test_merged_algebra.py pins
- * all of this, including the overflow, before any of it reaches a GPU.
+ * physics: the initial eta stops mattering.
  *
  * Seven values are carried, not six. After a compose D = 1 - A, so D looks
  * redundant -- but D is the small entry (roughly a^2/(1+p.phi)), and recovering

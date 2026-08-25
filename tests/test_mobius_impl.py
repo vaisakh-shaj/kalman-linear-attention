@@ -112,7 +112,7 @@ def test_gradients_match(mobius_impl):
     (y.square().sum() + y_var.sum()).backward()
     (y_r.square().sum() + y_var_r.sum()).backward()
 
-    for n, g, r in zip(names, got, ref):
+    for n, g, r in zip(names, got, ref, strict=True):
         assert g.grad is not None, f"no gradient reached {n}"
         assert torch.isfinite(g.grad).all(), f"{mobius_impl}: non-finite d{n}"
         assert _rel(g.grad, r.grad) < 1e-4, f"{mobius_impl}: d{n}"

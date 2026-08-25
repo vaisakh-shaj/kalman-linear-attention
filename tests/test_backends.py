@@ -283,7 +283,7 @@ def test_backward_matches_reference(backend):
     # -- exactly the inputs you need to see when a kernel change moves an adjoint.
     budget = prof.grad_tol
     rows, over = [], []
-    for name, got, ref in zip(INPUT_NAMES, inputs, refs):
+    for name, got, ref in zip(INPUT_NAMES, inputs, refs, strict=True):
         assert got.grad is not None, f"{backend}: no gradient reached {name}"
         assert torch.isfinite(got.grad).all(), f"{backend}: non-finite d{name}"
         err = rel_err(got.grad, ref.grad)
@@ -478,7 +478,7 @@ needs_triton = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="the fused triton kernel needs CUDA"
 )
 
-BLOCK_L = 64  # chunk_kla_scan.chunk_forward default chunk length
+BLOCK_L = 64  # a chunk length to straddle; the shipped default is CHUNK_BLOCK_L
 
 
 @needs_triton
@@ -627,7 +627,7 @@ def test_mps_chunk_boundaries(backend, L):
     torch.testing.assert_close(y.cpu(), y_ref, atol=5e-4, rtol=5e-4)
     torch.testing.assert_close(y_var.cpu(), y_var_ref, atol=5e-4, rtol=5e-4)
     torch.testing.assert_close(state.lam.cpu(), ref_state.lam, atol=1e-3, rtol=1e-4)
-    for name, got, ref in zip(INPUT_NAMES, inputs, refs):
+    for name, got, ref in zip(INPUT_NAMES, inputs, refs, strict=True):
         err = rel_err(got.grad.cpu(), ref.grad)
         assert err < 1e-2, f"{backend} L={L}: d{name} off by {err:.2e}"
 
@@ -661,7 +661,7 @@ def test_mps_threadgroup_geometry(backend, S, M):
 
     torch.testing.assert_close(y.cpu(), y_ref, atol=5e-4, rtol=5e-4)
     torch.testing.assert_close(y_var.cpu(), y_var_ref, atol=5e-4, rtol=5e-4)
-    for name, got, ref in zip(INPUT_NAMES, inputs, refs):
+    for name, got, ref in zip(INPUT_NAMES, inputs, refs, strict=True):
         err = rel_err(got.grad.cpu(), ref.grad)
         assert err < 1e-2, f"{backend} S={S} M={M}: d{name} off by {err:.2e}"
 
@@ -710,7 +710,7 @@ def test_mps_state_gradient_flows(backend):
     (ref_state.lam.square().sum() + ref_state.eta.sum()).backward()
 
     rows = []
-    for name, got, ref in zip(INPUT_NAMES, inputs, refs):
+    for name, got, ref in zip(INPUT_NAMES, inputs, refs, strict=True):
         if ref.grad is None:  # q enters only through the read-out
             assert got.grad is None or got.grad.abs().max() == 0
             continue
@@ -776,7 +776,7 @@ def test_mps_chunk_backward_is_the_recurrent_kernel():
         y, y_var, _ = kla_scan(*inputs, backend=backend)
         (y.square().sum() + y_var.sum()).backward()
         grads.append([t.grad for t in inputs])
-    for name, gr, gc in zip(INPUT_NAMES, *grads):
+    for name, gr, gc in zip(INPUT_NAMES, *grads, strict=True):
         torch.testing.assert_close(gc, gr, atol=1e-4, rtol=1e-3, msg=f"d{name}")
 
 
@@ -796,7 +796,7 @@ def test_mps_chunk_checkpoints_span_every_length(L):
     (y.square().sum() + y_var.sum()).backward()
     y_ref, y_var_ref, _ = kla_scan_reference(*refs)
     (y_ref.square().sum() + y_var_ref.sum()).backward()
-    for name, got, ref in zip(INPUT_NAMES, inputs, refs):
+    for name, got, ref in zip(INPUT_NAMES, inputs, refs, strict=True):
         err = rel_err(got.grad.cpu(), ref.grad)
         assert err < 1e-2, f"L={L}: d{name} off by {err:.2e}"
 
@@ -822,7 +822,7 @@ def test_mps_decode_from_prior(backend):
 
     torch.testing.assert_close(y.cpu(), y_ref, atol=5e-4, rtol=5e-4)
     torch.testing.assert_close(y_var.cpu(), y_var_ref, atol=5e-4, rtol=5e-4)
-    for name, got, ref in zip(INPUT_NAMES, inputs, refs):
+    for name, got, ref in zip(INPUT_NAMES, inputs, refs, strict=True):
         err = rel_err(got.grad.cpu(), ref.grad)
         assert err < 1e-2, f"{backend}: d{name} off by {err:.2e}"
 

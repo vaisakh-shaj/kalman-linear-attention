@@ -74,7 +74,7 @@ def launch_geometry(d_state: int) -> tuple[int, int]:
     return block_s, rows
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _library(stems: tuple, block_s: int, rows: int, chunk: int, items: int = 0):
     """Compile ``<stem>.metal`` sources for one geometry (cached per process)."""
     require_mps()

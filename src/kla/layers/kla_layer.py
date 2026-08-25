@@ -23,7 +23,7 @@ The heavy lifting (the parallel filter scan) is delegated to
 from __future__ import annotations
 
 import math
-from typing import NamedTuple, Optional
+from typing import NamedTuple
 
 import torch
 import torch.nn as nn
@@ -42,7 +42,7 @@ from kla.ops import KLAState, init_state, kla_scan, kla_step
 class KLALayerState(NamedTuple):
     """Full recurrent state of one layer: conv window + filter state."""
 
-    conv: Optional[torch.Tensor]  # [B, d_inner, K-1]
+    conv: torch.Tensor | None  # [B, d_inner, K-1]
     ssm: KLAState  # (lam, eta), each [B, d_inner, d_state]
 
 
@@ -130,8 +130,11 @@ class KLALayer(nn.Module):
 
     @torch.no_grad()
     def reset_parameters(self):
-        """(Re-)initialize all parameters. Safe to call after meta-device
-        construction + ``to_empty`` (e.g. inside nanochat's init_weights)."""
+        """(Re-)initialize all parameters.
+
+        Safe to call after meta-device construction + ``to_empty``, which is how
+        a training framework's own weight init reaches this layer.
+        """
         cfg = self.config
         M, S = self.d_inner, self.d_state
         for mod in self.modules():
@@ -260,13 +263,12 @@ class KLALayer(nn.Module):
         with torch.autocast(device_type=z.device.type, enabled=False):
             if cfg.checkpoint_ssm and torch.is_grad_enabled() and self.training:
                 # use_reentrant=True, not the modern default. The non-reentrant
-                # path recomputes the forward under a TorchDispatchMode, and
-                # torch's `scan` higher-order op -- which the torch recurrent
-                # cell is built on -- compiles its combine function at call
-                # time and cannot be traced through one. Reentrant simply reruns
-                # the forward, which the op is fine with. Everything this wraps
-                # has inputs that require grad and returns tensors, so the
-                # reentrant version's restrictions do not bite here.
+                # path recomputes the forward under a TorchDispatchMode, and the
+                # torch higher-order scan ops some cells build on compile their
+                # combine at call time and cannot be traced through one.
+                # Reentrant simply reruns the forward, which they are fine with.
+                # Everything this wraps has inputs that require grad and returns
+                # tensors, so the reentrant restrictions do not bite here.
                 y, y_var, new_state = torch.utils.checkpoint.checkpoint(
                     scan,
                     v,

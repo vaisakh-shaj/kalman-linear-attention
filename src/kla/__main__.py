@@ -61,14 +61,14 @@ def _by_backend() -> dict[str, list[str]]:
     return grouped
 
 
-# Accuracy contract, condensed from the parity profiles in tests/test_backends.py
-# (the tests are not importable from the installed package, so the numbers are
-# restated here; keep them in step).
+# Accuracy contract. The test suite's parity profiles are the source of truth,
+# but the tests are not importable from the installed package, so the budgets are
+# restated here; keep the two in step.
 _ATOL = _RTOL = 5e-4
-_GRAD_TOL = 1e-2
 # One budget for every gradient of every cell: they all differentiate the
-# *recurrence*, whose per-step gain is a scalar, so none of them has a
-# documented approximate input. See docs/implementations.md.
+# *recurrence*, whose per-step gain is a scalar, so none has an approximate
+# input. See docs/implementations.md.
+_GRAD_TOL = 1e-2
 _INPUT_NAMES = ("v", "lambda_v", "k", "q", "a", "p")
 
 
@@ -158,9 +158,9 @@ def _probe(family: str, requirements: list[tuple[bool, str]]) -> tuple[bool, str
 def _inputs(device: str, requires_grad: bool = False):
     """The probe batch every backend is run on.
 
-    Well-conditioned the same way ``tests/test_backends.py`` conditions its
-    inputs - lambda_v and p strictly positive, a inside (0, 1) - so a failure
-    here means the backend, not a pathological batch.
+    Well-conditioned the same way the test suite conditions its inputs -
+    lambda_v and p strictly positive, a inside (0, 1) - so a failure here means
+    the backend, not a pathological batch.
     """
     import torch
 
@@ -245,7 +245,7 @@ def _gradients(backend: str, device: str) -> tuple[str, str]:
     (y_ref.square().sum() + y_var_ref.sum()).backward()
 
     worst_name, worst_err = "", 0.0
-    for name, got, ref in zip(_INPUT_NAMES, args, refs):
+    for name, got, ref in zip(_INPUT_NAMES, args, refs, strict=True):
         if got.grad is None:
             return "FAILED", f"no gradient reached d{name}"
         if not torch.isfinite(got.grad).all():
@@ -371,7 +371,7 @@ def main(
             failed += not ok
         return 1 if failed and not survey else 0
 
-    device = kla.ops.default_device()
+    device = default_device()
     if device == "cuda":
         device = torch.cuda.get_device_name(0)
     print(f"kla {kla.__version__}   torch {torch.__version__}   device: {device}")

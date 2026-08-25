@@ -8,13 +8,13 @@ Three forwards, one per cell, and one backward they share (see
     applied rather than composed. No ``[B, L, M, S]`` intermediate.
 
 ``chunk_kla_scan``
-    ``mps_fused_chunk``. Time as a parallel axis, for the batch-1 prefill shapes the
+    ``mps_fused_chunk``. Time as a parallel axis, for the prefill shapes the
     other one leaves the GPU short of threads on.
 
 ``merged_chunk_kla_scan``
     ``mps_merged_chunk``. ``chunk`` with both recurrences folded into one 3x3
     map in homogeneous coordinates: one threadgroup scan instead of two, one
-    broadcast instead of two, and 24 fewer registers per thread at ``ITEMS=8``.
+    broadcast instead of two, and fewer registers per thread.
 
 ``kla_scan_bwd``
     The exact adjoint, shared. All three forwards write the same

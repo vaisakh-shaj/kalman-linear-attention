@@ -29,7 +29,7 @@ earlier prefix, and return the composed element.
 from __future__ import annotations
 
 import functools
-from typing import Callable, Sequence
+from collections.abc import Callable, Sequence
 
 import torch
 
@@ -51,7 +51,7 @@ def doubling_scan(
         combined = combine_fn(left, right)
         ys = tuple(
             torch.cat((t.narrow(dim, 0, offset), c), dim=dim)
-            for t, c in zip(ys, combined)
+            for t, c in zip(ys, combined, strict=True)
         )
         offset *= 2
     return ys
@@ -85,7 +85,9 @@ def chunk_scan(
         )
         if carry is not None:
             # The carry is the earlier prefix, so it goes on the left.
-            prefix = tuple(c.unsqueeze(dim).expand_as(b) for c, b in zip(carry, block))
+            prefix = tuple(
+                c.unsqueeze(dim).expand_as(b) for c, b in zip(carry, block, strict=True)
+            )
             block = combine_fn(prefix, block)
         carry = tuple(t.select(dim, width - 1) for t in block)
         blocks.append(block)
