@@ -77,7 +77,7 @@ def _mobius_combine_tracenorm(left, right):
     """Compose two 2x2 Möbius matrices in LINEAR space, normalized by the trace.
 
     The plain-matmul counterpart of :func:`_mobius_combine_log`, and the same
-    scheme the triton kernels use (``unfused_kla_scan._tracenorm_combine``).
+    scheme the GPU kernels use.
     Composing the maps is an ordinary 2x2 product; dividing all four entries by
     the trace afterwards keeps them O(1) without ever leaving linear space.
 
@@ -214,7 +214,7 @@ def _compute_dtype(*tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
     The scan is numerically delicate, so bf16/fp16 activations are always
     widened. float64 is *preserved* rather than downcast, which is what lets
     :func:`torch.autograd.gradcheck` run against these ops (see
-    ``tests/test_gradcheck.py``) — the GPU backends are float32-only and cannot
+    ``tests/test_gradcheck.py``), the GPU backends are float32-only and cannot
     be gradchecked.
     """
     return tuple(
@@ -271,7 +271,7 @@ def _broadcast_ap(a, p, like):
 
 
 def _recurrent_lambda_eta(phi, r, a, p, lam0, eta0):
-    """Both recurrences in one carry-based pass — *applied*, never composed.
+    """Both recurrences in one carry-based pass, *applied*, never composed.
 
     The recurrent implementation proper, and the only torch path that matches what
     ``recurrent`` means in the kernels::
@@ -280,8 +280,8 @@ def _recurrent_lambda_eta(phi, r, a, p, lam0, eta0):
         η_t   = (a/den_t)·η_{t-1} + r_t
 
     ``torch._higher_order_ops.scan`` carries ``(λ, η)`` along the sequence, so
-    there is no 2×2 matrix, no trace normalization and no prefix-product tensor
-    — about a quarter of the arithmetic of composing, and ``mobius_impl`` has
+    there is no 2×2 matrix, no trace normalization and no prefix-product tensor,
+    about a quarter of the arithmetic of composing, and ``mobius_impl`` has
     nothing to represent because nothing is composed. It also fuses what the
     composing path has to do in two passes: the gain α_t reads λ_{t-1}, which a
     carry already has in hand and an associative scan has to recover afterwards.
@@ -312,7 +312,13 @@ def _recurrent_lambda_eta(phi, r, a, p, lam0, eta0):
     (lam_fin, eta_fin), (lam, eta) = _scan(
         step, (dense(lam0), dense(eta0)), (phi.contiguous(), r.contiguous()), dim=1
     )
-    return lam, eta, lam_fin, eta_fin
+    # The HOP stacks its per-step outputs along dim 0 whatever `dim` was scanned
+    # -- "each tensor leaf is a stacked output along first dim", as its own
+    # docstring puts it. So these come back [L, B, M, S] and the rest of this
+    # module wants [B, L, M, S]. Without the move the read-out einsum contracts
+    # L against B and raises, which is what
+    # tests/test_ops.py::test_parallel_matches_reference[sequential] pins.
+    return lam.movedim(0, 1), eta.movedim(0, 1), lam_fin, eta_fin
 
 
 def kla_scan_torch(
@@ -333,7 +339,7 @@ def kla_scan_torch(
     ``scan_impl`` picks *how* the scan is parallelized (see
     :func:`kla.ops.scan.resolve_scan`); ``mobius_impl`` picks how the precision
     map is *represented* while it is composed. The two are orthogonal, except
-    that ``scan_impl="sequential"`` composes nothing — it takes the recurrent
+    that ``scan_impl="sequential"`` composes nothing, it takes the recurrent
     path in :func:`_recurrent_lambda_eta` and ignores ``mobius_impl``.
 
     ``mobius_impl="linear"`` (default) composes the 2x2 maps as plain matmuls
@@ -542,17 +548,14 @@ def kla_scan_reference(
 
 # --------------------------------------------------------------- the registry
 #
-# One entry per implementation, named
+# Twelve cells: three implementations on each of four backends, named
 # "<backend>[_unfused|_merged]_<implementation>" (see docs/implementations.md).
 # "fused" is the default and carries no token; "merged" is fused *and* one scan
-# rather than two. A bare backend name aliases that backend's default
-# implementation.
+# rather than two. A bare backend name aliases that backend's default.
 #
 # The record carries only what the dispatcher and `python -m kla` actually read.
-# Everything in the contract -- forward, exact backward, state carry, prior
-# decode, fp32 -- is required of every implementation, so it is not a per-cell
-# flag. `exact_bwd` is the one exception: the two prior CUDA kernels are kept
-# precisely because they violate it, as the comparison for the exact ones.
+# Everything in the contract -- forward, *exact* backward, state carry, prior
+# decode, fp32 -- is required of every cell, so none of it is a per-cell flag.
 
 
 class Impl(NamedTuple):
@@ -566,10 +569,9 @@ class Impl(NamedTuple):
     """
 
     backend: str  # torch | triton | cuda | mps
-    implementation: str  # recurrent | chunk | pscan
+    implementation: str  # recurrent | chunk
     fusion: str  # unfused | fused | merged -- how much is folded together
     max_d_state: Optional[int]  # None = no ceiling
-    exact_bwd: bool
     fn: Callable
 
 
@@ -597,17 +599,6 @@ def _triton_scan(kernel: str) -> Callable:
     return run
 
 
-def _cuda_scan(kernel_version: str) -> Callable:
-    """One of the prior v2_* kernels, kept as the approximate-backward baseline."""
-
-    def run(*args, **kwargs):
-        from kla.ops.cuda_backend import kla_scan_cuda
-
-        return kla_scan_cuda(*args, kernel_version=kernel_version, **kwargs)
-
-    return run
-
-
 def _cuda_exact(name: str) -> Callable:
     def run(*args, **kwargs):
         import kla.ops.cuda_backend as cuda
@@ -627,85 +618,64 @@ def _mps_scan(name: str) -> Callable:
 
 
 _BACKENDS: dict[str, Impl] = {
-    # torch -- portable reference, the only one that runs float64
+    # torch -- portable reference, the only backend that runs float64. It has no
+    # *fused* cells, so "merged" here reads as "unfused, but one scan": the
+    # single fusion axis cannot spell both tokens, and unfused is what torch
+    # always is. That cell is what lets the merged algebra be gradchecked
+    # against finite differences rather than against another fp32 kernel.
     "torch_unfused_recurrent": Impl(
-        "torch", "recurrent", "unfused", None, True, _torch_scan("sequential")
+        "torch", "recurrent", "unfused", None, _torch_scan("sequential")
     ),
     "torch_unfused_chunk": Impl(
-        "torch", "chunk", "unfused", None, True, _torch_scan("chunk")
+        "torch", "chunk", "unfused", None, _torch_scan("chunk")
     ),
-    "torch_unfused_pscan": Impl(
-        "torch", "pscan", "unfused", None, True, _torch_scan("auto")
-    ),
-    # torch, merged -- one scan instead of two. torch has no *fused* cells, so
-    # "merged" here means "unfused, but one scan": the single fusion axis cannot
-    # spell both tokens, and unfused is what torch always is. Kept because it is
-    # the only merged cell that runs float64 and can be gradchecked.
     "torch_merged_chunk": Impl(
-        "torch", "chunk", "merged", None, True, _torch_scan("chunk", merged=True)
-    ),
-    "torch_merged_pscan": Impl(
-        "torch", "pscan", "merged", None, True, _torch_scan("auto", merged=True)
+        "torch", "chunk", "merged", None, _torch_scan("chunk", merged=True)
     ),
     # triton
-    "triton_recurrent": Impl(
-        "triton", "recurrent", "fused", None, True, _triton_scan("recurrent")
+    "triton_fused_recurrent": Impl(
+        "triton", "recurrent", "fused", None, _triton_scan("recurrent")
     ),
-    "triton_chunk": Impl("triton", "chunk", "fused", None, True, _triton_scan("chunk")),
-    "triton_pscan": Impl("triton", "pscan", "fused", None, True, _triton_scan("pscan")),
-    "triton_unfused_recurrent": Impl(
-        "triton", "recurrent", "unfused", None, True, _triton_scan("unfused_recurrent")
-    ),
-    "triton_unfused_chunk": Impl(
-        "triton", "chunk", "unfused", None, True, _triton_scan("unfused_chunk")
-    ),
-    "triton_unfused_pscan": Impl(
-        "triton", "pscan", "unfused", None, True, _triton_scan("unfused_pscan")
+    "triton_fused_chunk": Impl("triton", "chunk", "fused", None, _triton_scan("chunk")),
+    "triton_merged_chunk": Impl(
+        "triton", "chunk", "merged", None, _triton_scan("merged_chunk")
     ),
     # cuda
-    "cuda_recurrent": Impl(
-        "cuda", "recurrent", "fused", 64, True, _cuda_exact("kla_scan_cuda_recurrent")
+    "cuda_fused_recurrent": Impl(
+        "cuda", "recurrent", "fused", 64, _cuda_exact("kla_scan_cuda_recurrent")
     ),
-    "cuda_chunk": Impl(
-        "cuda", "chunk", "fused", 64, True, _cuda_exact("kla_scan_cuda_chunk")
+    "cuda_fused_chunk": Impl(
+        "cuda", "chunk", "fused", 64, _cuda_exact("kla_scan_cuda_chunk")
     ),
-    "cuda_pscan": Impl(
-        "cuda", "pscan", "fused", 64, True, _cuda_exact("kla_scan_cuda_pscan")
+    "cuda_merged_chunk": Impl(
+        "cuda", "chunk", "merged", 64, _cuda_exact("kla_scan_cuda_merged_chunk")
     ),
-    # prior kernels, kept as the approximate-backward comparison
-    "cuda_v2_2": Impl("cuda", "chunk", "fused", 64, False, _cuda_scan("v2_2")),
-    "cuda_v2_1": Impl("cuda", "chunk", "fused", 64, False, _cuda_scan("v2_1")),
     # mps
-    "mps_recurrent": Impl(
-        "mps", "recurrent", "fused", 128, True, _mps_scan("kla_scan_mps_recurrent")
+    "mps_fused_recurrent": Impl(
+        "mps", "recurrent", "fused", 128, _mps_scan("kla_scan_mps_recurrent")
     ),
-    "mps_chunk": Impl(
-        "mps", "chunk", "fused", 128, True, _mps_scan("kla_scan_mps_chunk")
+    "mps_fused_chunk": Impl(
+        "mps", "chunk", "fused", 128, _mps_scan("kla_scan_mps_chunk")
     ),
-    "mps_pscan": Impl(
-        "mps", "pscan", "fused", 128, True, _mps_scan("kla_scan_mps_pscan")
-    ),
-    # mps, merged -- one scan for both recurrences. `recurrent` has no merged
-    # cell and never will: it *applies* the map rather than composing it, so it
-    # already does λ and η in one pass, and a merged variant would be the same
-    # kernel under a second name.
     "mps_merged_chunk": Impl(
-        "mps", "chunk", "merged", 128, True, _mps_scan("kla_scan_mps_merged_chunk")
-    ),
-    "mps_merged_pscan": Impl(
-        "mps", "pscan", "merged", 128, True, _mps_scan("kla_scan_mps_merged_pscan")
+        "mps", "chunk", "merged", 128, _mps_scan("kla_scan_mps_merged_chunk")
     ),
 }
 
-# A bare backend name is that backend's default implementation. `chunk` was the
-# placeholder everywhere; torch and mps have been measured since (see
-# docs/benchmarks/mps.md) and both moved to `recurrent`, which won every shape
-# either is realistically used at. triton and cuda are still unmeasured.
+# A bare backend name is that backend's default implementation, and all four are
+# measured rather than assumed. torch and mps take `recurrent`, which won every
+# shape either is realistically used at (docs/benchmarks/mps.md). triton and cuda
+# take `chunk`: on an L40S `recurrent` is latency-bound on its serial chain and
+# flat from 256 lanes to 65536, so the crossover that put mps on `recurrent` sits
+# two orders of magnitude further out. Between the two chunk cells, triton takes
+# the *merged* one -- it beat the two-scan cell at every shape measured and never
+# lost -- and cuda does not, because there merging costs 3-29% instead of saving.
+# Same algebra, opposite verdicts; see docs/benchmarks/cuda.md.
 _ALIASES = {
     "torch": "torch_unfused_recurrent",
-    "triton": "triton_chunk",
-    "cuda": "cuda_chunk",
-    "mps": "mps_recurrent",
+    "triton": "triton_merged_chunk",
+    "cuda": "cuda_fused_chunk",
+    "mps": "mps_fused_recurrent",
 }
 
 
@@ -727,9 +697,10 @@ def _mps_available() -> bool:
     return is_available()
 
 
-# Device -> the backend "auto" picks there, if its kernels are importable. The
-# `cuda` kernels are deliberately absent: their backward is an approximate
-# adjoint, so they stay opt-in until the exact cells land.
+# Device -> the backend "auto" picks there, if its kernels are importable. `cuda`
+# is deliberately absent even though it is 1.2-2x triton on the same algebra: it
+# needs nvcc and a matching C++ toolchain at first use, which "auto" cannot
+# assume. Pin backend="cuda" to get it.
 _AUTO = (
     ("is_cuda", "triton", _triton_available),
     ("is_mps", "mps", _mps_available),
@@ -766,7 +737,7 @@ def kla_scan(
     Inputs in paper notation: value ``v``, value precision ``lambda_v`` (Λ^v),
     key ``k``, query ``q``, discrete decay ``a``, process noise ``p``.
 
-    ``backend`` takes an implementation name ("mps_recurrent"), a bare backend
+    ``backend`` takes an implementation name ("mps_fused_recurrent"), a bare backend
     name for that backend's default ("mps"), or "auto". "auto" is the only value
     that is not a fixed implementation: it reads the device and nothing else, so
     the kernels a run used are a function of the config and the machine and

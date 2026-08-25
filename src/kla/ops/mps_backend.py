@@ -1,28 +1,35 @@
-"""MPS (Apple silicon) backend for the KLA scan — two strategies, one device.
+"""MPS (Apple silicon) backend for the KLA scan, three cells, one backward.
 
 Metal shaders compiled at first use through :func:`torch.mps.compile_shader`,
 which ships inside torch, so there is no toolchain and no extra dependency.
 
-``backend="mps_recurrent"`` (the default)
-    One kernel for the forward and one for the backward, with no ``[B,L,M,S]``
-    intermediate in device memory — only two ``[B, M, ceil(L/CHUNK), S]``
-    checkpoints the backward replays from. Capped at ``MAX_DSTATE`` states.
-``backend="mps_chunk"``
-    Time as a parallel axis. The recurrent one puts a thread on each
-    ``(batch, channel, state)`` triple, which stops filling the GPU below
-    roughly 6k of them — batch-1 prefill on a narrow model. This one splits each
-    tile of timesteps across a threadgroup instead, ~2x faster there and ~2.5x
-    slower everywhere else, since composing the Möbius maps costs more than
-    applying them. Its backward is the recurrent kernel's, run from checkpoints
-    the chunk forward writes.
+``kla_scan_mps_recurrent`` (``mps_fused_recurrent``, the default)
+    One thread per ``(batch, channel, state)`` triple, time as the serial axis,
+    the Möbius map *applied* to a running λ rather than composed with its
+    neighbours. Nothing but the state itself is carried, and no ``[B,L,M,S]``
+    intermediate reaches device memory.
+``kla_scan_mps_chunk`` (``mps_fused_chunk``)
+    Time as a parallel axis instead: each tile of timesteps is split across a
+    threadgroup, which fills the GPU at the low lane counts the recurrent grid
+    leaves it short at, batch-1 prefill on a narrow model. Composing the maps
+    costs more than applying them, so it loses everywhere else.
+``kla_scan_mps_merged_chunk`` (``mps_merged_chunk``)
+    ``mps_fused_chunk`` with the precision and information recurrences folded into a
+    single 3x3 map, so the threadgroup scans once instead of twice and the
+    ``var_h``/``alpha_h``/``r_h`` per-thread arrays disappear. 15-30% faster than
+    ``mps_fused_chunk`` at every shape measured; see ``docs/benchmarks/mps.md``.
 
-Both are exact in the backward, and both carry the filter state in and out
-differentiably, where the equally-fused CUDA ``v2_*`` kernels do neither. That
-falls out of the implementation: ``mps_recurrent`` puts one thread on each
-``(batch, channel, state)`` triple and walks time serially, so the Möbius map is
-applied to a running λ rather than composed with its neighbours, which leaves
-the adjoint elementary (``∂λ_t/∂λ_{t-1} = 1/(a²·den²)``). ``mps_chunk`` then
-reuses that same adjoint.
+The crossover is around 8k lanes (``B x d_inner x d_state``) on an M5 Pro, and
+every realistic config sits above it, which is why ``backend="mps"`` resolves to
+``mps_fused_recurrent``. **Do not carry that number to another device**, the same
+serial chain is latency-bound on an L40S and the crossover moves by two orders
+of magnitude.
+
+All three are exact in the backward and carry the filter state in and out
+differentiably. That falls out of the recurrent kernel: applying the map leaves
+the adjoint elementary (``∂λ_t/∂λ_{t-1} = 1/(a²·den²)``), and the two chunk
+cells reuse it, replaying from ``[B, M, ceil(L/CHUNK), S]`` checkpoints their
+forwards write.
 
 Everything runs in float32: Metal has no float64, so ``gradcheck`` still needs
 ``backend="torch"``.
@@ -152,97 +159,6 @@ def kla_scan_mps_merged_chunk(
     # back into dv and d(Λ^v), and floor p here so the floor's subgradient is
     # torch's too.
     y, y_var, lam_fin, eta_fin = merged_chunk_kla_scan(
-        (v * lambda_v).contiguous(),
-        lambda_v,
-        k,
-        q,
-        a.float().contiguous(),
-        p.float().clamp_min(P_MIN).contiguous(),
-        lam0.contiguous(),
-        eta0.contiguous(),
-        decode_from_prior,
-    )
-    return y, y_var, KLAState(lam=lam_fin, eta=eta_fin)
-
-
-def kla_scan_mps_pscan(
-    v: torch.Tensor,
-    lambda_v: torch.Tensor,
-    k: torch.Tensor,
-    q: torch.Tensor,
-    a: torch.Tensor,
-    p: torch.Tensor,
-    initial_state: Optional[KLAState] = None,
-    decode_from_prior: bool = False,
-):
-    """Reduce-then-scan MPS scan. Same contract as :func:`kla.ops.kla_scan_torch`."""
-    from kla.ops.kernels.mps._shaders import MAX_DSTATE, require_mps
-    from kla.ops.kernels.mps.pscan_kla_scan import pscan_kla_scan
-
-    require_mps()
-    if not v.is_mps:
-        raise _unsupported("requires 'mps' tensors", "pscan")
-    if a.dim() != 2:
-        raise _unsupported("expects a/p of shape [M, S]", "pscan")
-    S = k.shape[2]
-    if S > MAX_DSTATE:
-        raise _unsupported(f"supports d_state <= {MAX_DSTATE} (got {S})", "pscan")
-
-    v, lambda_v, k, q, lam0, eta0 = _prepare(v, lambda_v, k, q, initial_state)
-
-    # As in the other two cells: fold v·Λ^v in torch so autograd splits
-    # d(v·Λ^v) back into dv and d(Λ^v), and floor p here so the floor's
-    # subgradient is torch's too.
-    y, y_var, lam_fin, eta_fin = pscan_kla_scan(
-        (v * lambda_v).contiguous(),
-        lambda_v,
-        k,
-        q,
-        a.float().contiguous(),
-        p.float().clamp_min(P_MIN).contiguous(),
-        lam0.contiguous(),
-        eta0.contiguous(),
-        decode_from_prior,
-    )
-    return y, y_var, KLAState(lam=lam_fin, eta=eta_fin)
-
-
-def kla_scan_mps_merged_pscan(
-    v: torch.Tensor,
-    lambda_v: torch.Tensor,
-    k: torch.Tensor,
-    q: torch.Tensor,
-    a: torch.Tensor,
-    p: torch.Tensor,
-    initial_state: Optional[KLAState] = None,
-    decode_from_prior: bool = False,
-):
-    """Reduce-then-scan MPS scan, one round for both recurrences.
-
-    :func:`kla_scan_mps_pscan` with the second reduce-scan-apply round removed:
-    the merged 3x3 leaf carries η, so there is no set of affine leaves waiting
-    on λ. Same contract as :func:`kla.ops.kla_scan_torch`, same backward.
-    """
-    from kla.ops.kernels.mps._shaders import MAX_DSTATE, require_mps
-    from kla.ops.kernels.mps.merged_pscan_kla_scan import merged_pscan_kla_scan
-
-    require_mps()
-    if not v.is_mps:
-        raise _unsupported("requires 'mps' tensors", "merged pscan")
-    if a.dim() != 2:
-        raise _unsupported("expects a/p of shape [M, S]", "merged pscan")
-    S = k.shape[2]
-    if S > MAX_DSTATE:
-        raise _unsupported(
-            f"supports d_state <= {MAX_DSTATE} (got {S})", "merged pscan"
-        )
-
-    v, lambda_v, k, q, lam0, eta0 = _prepare(v, lambda_v, k, q, initial_state)
-
-    # As in every other cell: fold v·Λ^v in torch so autograd splits d(v·Λ^v)
-    # back into dv and d(Λ^v), and floor p here so the floor's subgradient is
-    # torch's too.
-    y, y_var, lam_fin, eta_fin = merged_pscan_kla_scan(
         (v * lambda_v).contiguous(),
         lambda_v,
         k,

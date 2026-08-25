@@ -1,6 +1,6 @@
-"""The Metal backward — one exact adjoint for both MPS implementations.
+"""The Metal backward, one exact adjoint for both MPS implementations.
 
-``mps_recurrent`` and ``mps_chunk`` write the same ``[B, M, NCK, S]``
+``mps_fused_recurrent`` and ``mps_fused_chunk`` write the same ``[B, M, NCK, S]``
 checkpoints at the same stride, so they share this. The kernel is lane-per-state
 whatever geometry the forward used: the reverse walk is over the serial state
 lanes either way, which is why composing the map in a forward buys the backward

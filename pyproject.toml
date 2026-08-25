@@ -5,7 +5,7 @@ description = "Kalman Linear Attention (KLA): a linear-attention layer that runs
 readme = "readme.md"
 requires-python = ">=3.10"
 license = "MIT"
-# uv_build does NOT bundle LICENSE automatically — without this the wheel ships
+# uv_build does NOT bundle LICENSE automatically, without this the wheel ships
 # `License-Expression: MIT` and no license text.
 license-files = ["LICENSE"]
 authors = [

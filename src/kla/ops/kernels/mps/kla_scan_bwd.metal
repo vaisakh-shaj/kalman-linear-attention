@@ -191,7 +191,7 @@ kernel void kla_scan_bwd(
             }
             acc_da += da2 * da2_da;
 
-            // phi = clamp_min(Lambda^v.k^2, EPS) — zero subgradient once floored.
+            // phi = clamp_min(Lambda^v.k^2, EPS), zero subgradient once floored.
             const float phi_live = (raw_phi > KLA_EPS) ? 1.0f : 0.0f;
             const float dsi_c = dphi * phi_live * k_t * k_t;
             const float dmsi_c = dr * k_t;

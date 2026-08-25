@@ -17,7 +17,7 @@ triton is unusable here, so it is a CI smoke test. ``all`` is a survey and
 always exits 0 - on a CPU-only box the GPU ones are expected to fail.
 
 ``--test-backends`` takes either a backend (``mps``, which runs every Metal
-implementation) or one exact name (``mps_recurrent``), so a single
+implementation) or one exact name (``mps_fused_recurrent``), so a single
 implementation can be pinned and checked on its own. See
 ``docs/implementations.md`` for the naming scheme.
 """
@@ -66,23 +66,9 @@ def _by_backend() -> dict[str, list[str]]:
 # restated here; keep them in step).
 _ATOL = _RTOL = 5e-4
 _GRAD_TOL = 1e-2
-# An implementation declaring exact_bwd=False differentiates the Moebius
-# *composition* rather than the recurrence, which is ill-conditioned in float32
-# on the precision-scan path. Its d(lambda_v), d(k), d(a) and d(p) are held to a
-# documented looser budget; tightening them would fail a *correct* build. Only
-# the two prior CUDA kernels declare it - see docs/implementations.md.
-_LOOSE_GRADS = ("lambda_v", "k", "a", "p")
-_LOOSE_GRAD_TOL = 0.25
-
-
-def _loose_for(name: str) -> tuple[str, ...]:
-    """The inputs ``name`` is allowed an approximate gradient on."""
-    from kla.ops.kla_ops import implementations
-
-    impl = implementations().get(name)
-    return () if impl is None or impl.exact_bwd else _LOOSE_GRADS
-
-
+# One budget for every gradient of every cell: they all differentiate the
+# *recurrence*, whose per-step gain is a scalar, so none of them has a
+# documented approximate input. See docs/implementations.md.
 _INPUT_NAMES = ("v", "lambda_v", "k", "q", "a", "p")
 
 
@@ -258,23 +244,18 @@ def _gradients(backend: str, device: str) -> tuple[str, str]:
     y_ref, y_var_ref, _ = kla_scan_reference(*refs)
     (y_ref.square().sum() + y_var_ref.sum()).backward()
 
-    loose = _loose_for(backend)
-    worst_name, worst_ratio, worst_err = "", 0.0, 0.0
+    worst_name, worst_err = "", 0.0
     for name, got, ref in zip(_INPUT_NAMES, args, refs):
         if got.grad is None:
             return "FAILED", f"no gradient reached d{name}"
         if not torch.isfinite(got.grad).all():
             return "FAILED", f"non-finite d{name}"
         err = _rel_err(got.grad, ref.grad)
-        budget = _LOOSE_GRAD_TOL if name in loose else _GRAD_TOL
-        if err / budget > worst_ratio:
-            worst_name, worst_ratio, worst_err = name, err / budget, err
+        if err > worst_err:
+            worst_name, worst_err = name, err
 
-    budget = _LOOSE_GRAD_TOL if worst_name in loose else _GRAD_TOL
-    detail = f"worst d{worst_name} {worst_err:.1e}   (budget {budget:g})"
-    if loose:
-        detail += f"   [d{', d'.join(loose)} approximate by design]"
-    return ("ok" if worst_ratio < 1.0 else "FAILED"), detail
+    detail = f"worst d{worst_name} {worst_err:.1e}   (budget {_GRAD_TOL:g})"
+    return ("ok" if worst_err < _GRAD_TOL else "FAILED"), detail
 
 
 _CHECKS = (("forward", _forward), ("gradients", _gradients))
@@ -309,7 +290,7 @@ def main(
         check_backends: Show every backend and whether it is usable here,
             without running it.
         test_backends: Run the named backends against the reference. Takes a
-            backend ('mps'), an exact implementation ('mps_recurrent'), or 'all'.
+            backend ('mps'), an exact implementation ('mps_fused_recurrent'), or 'all'.
     """
     import torch
 
@@ -343,18 +324,16 @@ def main(
                     if impl.max_d_state is None
                     else f"d_state<={impl.max_d_state}"
                 )
-                note = "" if impl.exact_bwd else "   approximate backward"
                 default = "  <- default" if aliases.get(name) == cell else ""
                 fused = f"{impl.fusion:<7}"
                 print(
                     f"        {cell:<{cell_width}}  {fused}  "
-                    f"{impl.implementation:<9}  {cap}{note}{default}"
+                    f"{impl.implementation:<9}  {cap}{default}"
                 )
         print("\n  [X] = what backend='auto' resolves to here")
         print(
             "  Every implementation has a forward, an exact backward, state "
-            "carry,\n  prior decode and an fp32 scan, unless its row says "
-            "otherwise."
+            "carry,\n  prior decode and an fp32 scan."
         )
         return 0
 

@@ -1,33 +1,26 @@
 """Cross-backend parity: every available backend against the sequential reference.
 
-The backends implement the same math with very different numerics, so each gets
-its own tolerance profile rather than one shared threshold:
+Twelve cells, three implementations on each of four backends, named
+``<backend>[_unfused|_merged]_<implementation>`` (see ``docs/implementations.md``).
+They implement the same math with very different numerics, so each gets its own
+forward tolerance rather than one shared threshold:
 
-Implementations are named ``<backend>[_unfused|_merged]_<implementation>`` — see
-``docs/implementations.md``.
+* ``torch_unfused_*``, the reference. Tightest of the four, and the only
+  backend that runs float64.
+* ``triton_*`` / ``cuda_*`` / ``mps_*``, hand-written kernels, fully fused.
 
-* ``torch_unfused_*`` — the reference. Forward and backward both tight.
-* ``triton_*`` — hand-written kernels with an exact reverse-scan adjoint. Tight.
-* ``cuda_v2_*`` — the prior CUDA kernels. Their forward is bit-exact, but the
-  trace-normalized Möbius **backward is not the exact adjoint** (see the parity
-  notes in :mod:`kla.ops.cuda_backend`): gradients that flow through the
-  precision scan are only accurate to ~5-15 % relative, while the ones that flow
-  through the information-vector / read-out path are exact.
-* ``*_merged_*`` — one associative scan for both recurrences instead of two
-  (:func:`kla.ops.kla_ops._merged_combine`). Same tolerances as the two-scan
-  cells they replace, deliberately: a merged cell needing a looser budget would
-  be a regression, not a variant. The algebra is pinned separately in
-  ``tests/test_merged_algebra.py``.
-* ``mps_*`` — the Metal kernels (:mod:`kla.ops.mps_backend`). Tight *despite*
-  being fully fused: applying the Möbius map per step instead of composing it
-  makes the adjoint elementary, so they have none of the CUDA kernels' gradient
-  looseness even though they are the same fully-fused shape.
+**Every cell's backward is the exact adjoint**, and that is the claim this file
+exists to hold. A fully fused kernel with a hand-written backward has no
+structural reason to be tight, differentiating a trace-normalized prefix
+product is a 4x4 Jacobian chain that degenerates in float32. These kernels
+differentiate the *recurrence* instead, whose per-step gain is a scalar, so
+every one of the six inputs is held to the same tight budget on every cell. An
+input needing a looser budget would be a bug, not a variant.
 
-The ``cuda_v2_*`` point is why :data:`PROFILES` splits the gradient inputs into
-``exact_grads`` and ``loose_grads``. Asserting a tight threshold on the loose
-group would fail on a *correct* build — the looseness is a documented property
-of that backward, not a bug to be caught here. Those two are the only
-implementations allowed it; everything else must be exact.
+``*_merged_*`` runs one associative scan for both recurrences instead of two
+(:func:`kla.ops.kla_ops._merged_combine`), and takes the same tolerances as the
+two-scan cell it replaces, deliberately, for the same reason. The merged
+algebra is pinned separately in ``tests/test_merged_algebra.py``.
 
 Backends that cannot run here raise :class:`NotImplementedError` from the
 dispatcher and are skipped, so this file is meaningful on a CPU-only box, on a
@@ -54,19 +47,10 @@ class Profile:
     name: str
     fwd_atol: float
     fwd_rtol: float
-    exact_grads: tuple[str, ...]
-    """Inputs whose gradient the backend computes exactly (tight threshold)."""
-    loose_grads: tuple[str, ...] = ()
-    """Inputs with a documented approximate gradient (relaxed threshold)."""
-    exact_grad_tol: float = 2e-3
-    loose_grad_tol: float = 0.25
-    returns_state: bool = True
-    supports_initial_state: bool = True
-    clips_phi: bool = False
-    """True for v2_1, which caps ``phi`` at 1000. Inverts the assertion in
-    :func:`test_high_information_tokens_are_not_clipped` — that backend is
-    *required* to deviate, so the test fails loudly if its clamp ever stops
-    engaging."""
+    grad_tol: float = 2e-3
+    """Budget for *every* input's gradient. There is no loose group: each cell
+    differentiates the recurrence, whose per-step gain is a scalar, so all six
+    are exact adjoints and anything above ~1e-6 means a real bug."""
     scan_form: str = (
         "composes the same maps with a parallel associative scan over "
         "trace-normalized 2x2 matrices"
@@ -90,206 +74,38 @@ _MERGED_FORM = (
 PROFILES = {
     p.name: p
     for p in [
-        Profile("torch_unfused_pscan", 2e-4, 1e-4, exact_grads=INPUT_NAMES),
-        Profile("torch_unfused_recurrent", 2e-4, 1e-4, exact_grads=INPUT_NAMES),
-        Profile("torch_unfused_chunk", 2e-4, 1e-4, exact_grads=INPUT_NAMES),
-        # The merged cells compose ONE map for both recurrences (the 3x3 of
-        # kla_ops._merged_combine) where every other cell composes two. Same
-        # tolerance as the two-scan torch cells: lambda is bit-identical by
-        # construction and eta stays at the fp32 floor -- pinned, with the
-        # measured numbers, in tests/test_merged_algebra.py.
+        # torch -- the reference. The merged cell composes ONE map for both
+        # recurrences (the 3x3 of kla_ops._merged_combine) where the other two
+        # compose a 2x2 and then an affine map, and takes the same tolerance:
+        # lambda is bit-identical by construction and eta stays at the fp32
+        # floor -- pinned, with the measured numbers, in test_merged_algebra.py.
+        Profile("torch_unfused_recurrent", 2e-4, 1e-4, scan_form=_LANE_FORM),
+        Profile("torch_unfused_chunk", 2e-4, 1e-4),
+        Profile("torch_merged_chunk", 2e-4, 1e-4, scan_form=_MERGED_FORM),
+        # triton. All three share kla.ops.kernels.triton.kla_scan_bwd, which
+        # replays a scalar recurrence from checkpoints -- so it cannot tell
+        # which forward wrote them, and the merged cell gets the same budget as
+        # the two-scan one it replaces.
         Profile(
-            "torch_merged_chunk",
-            2e-4,
-            1e-4,
-            exact_grads=INPUT_NAMES,
-            scan_form=_MERGED_FORM,
+            "triton_fused_recurrent", 5e-4, 5e-4, grad_tol=1e-2, scan_form=_LANE_FORM
         ),
+        Profile("triton_fused_chunk", 5e-4, 5e-4, grad_tol=1e-2),
         Profile(
-            "torch_merged_pscan",
-            2e-4,
-            1e-4,
-            exact_grads=INPUT_NAMES,
-            scan_form=_MERGED_FORM,
+            "triton_merged_chunk", 5e-4, 5e-4, grad_tol=1e-2, scan_form=_MERGED_FORM
         ),
-        # Both triton chunk cells get the exact-gradient contract: the fused one
-        # shares kla.ops.kernels.triton.kla_scan_bwd, which differentiates the
-        # recurrence rather than the composed map.
+        # cuda. Same shape of claim, one backward again
+        # (kernels/cuda/scan/kla_scan_bwd.cuh).
         Profile(
-            "triton_recurrent",
-            5e-4,
-            5e-4,
-            exact_grads=INPUT_NAMES,
-            exact_grad_tol=1e-2,
-            scan_form=_LANE_FORM,
+            "cuda_fused_recurrent", 5e-4, 5e-4, grad_tol=1e-2, scan_form=_LANE_FORM
         ),
-        Profile(
-            "triton_chunk",
-            5e-4,
-            5e-4,
-            exact_grads=INPUT_NAMES,
-            exact_grad_tol=1e-2,
-        ),
-        Profile(
-            "triton_pscan",
-            5e-4,
-            5e-4,
-            exact_grads=INPUT_NAMES,
-            exact_grad_tol=1e-2,
-            scan_form=(
-                "composes the same maps per chunk, then resolves the chunks "
-                "with a parallel scan carrying nothing between them"
-            ),
-        ),
-        # The three unfused cells share one backward too: the adjoint reads the
-        # values lambda and eta, not the order a forward produced them in.
-        Profile(
-            "triton_unfused_recurrent",
-            5e-4,
-            5e-4,
-            exact_grads=INPUT_NAMES,
-            exact_grad_tol=1e-2,
-            scan_form=_LANE_FORM,
-        ),
-        Profile(
-            "triton_unfused_chunk",
-            5e-4,
-            5e-4,
-            exact_grads=INPUT_NAMES,
-            exact_grad_tol=1e-2,
-        ),
-        Profile(
-            "triton_unfused_pscan",
-            5e-4,
-            5e-4,
-            exact_grads=INPUT_NAMES,
-            exact_grad_tol=1e-2,
-            scan_form=(
-                "composes the same maps per chunk, then resolves the chunks "
-                "with a parallel scan carrying nothing between them"
-            ),
-        ),
-        # The exact CUDA cells: same algebra as v2_* below, but they
-        # differentiate the recurrence rather than the composition, so every
-        # input is tight -- see kernels/cuda/scan/kla_scan_bwd.cuh.
-        Profile(
-            "cuda_recurrent",
-            5e-4,
-            5e-4,
-            exact_grads=INPUT_NAMES,
-            exact_grad_tol=1e-2,
-            scan_form=_LANE_FORM,
-        ),
-        # Composed forward, but the same lane-per-state backward, so it gets the
-        # same exact-gradient contract.
-        Profile(
-            "cuda_chunk",
-            1e-3,
-            1e-3,
-            exact_grads=INPUT_NAMES,
-            exact_grad_tol=1e-2,
-        ),
-        # Same composition, resolved across chunks by a parallel scan instead of
-        # a serial carry; the backward is the same one again.
-        Profile(
-            "cuda_pscan",
-            1e-3,
-            1e-3,
-            exact_grads=INPUT_NAMES,
-            exact_grad_tol=1e-2,
-            scan_form=(
-                "composes the same maps per chunk, then resolves the chunks "
-                "with a parallel scan carrying nothing between them"
-            ),
-        ),
-        # Exact forward; the precision-scan adjoint is approximate. dv and
-        # dq ride the information-vector / read-out path and stay exact, whereas
-        # d(lambda_v) additionally feeds the precision scan, so it is loose.
-        Profile(
-            "cuda_v2_2",
-            1e-4,
-            1e-4,
-            exact_grads=("v", "q"),
-            loose_grads=("lambda_v", "k", "a", "p"),
-            returns_state=False,
-            supports_initial_state=False,
-        ),
-        # The harder-clamped variant. Same numerics as v2_2 on well-conditioned
-        # inputs -- it diverges only where its phi ceiling engages, which is what
-        # `clips_phi` pins down.
-        Profile(
-            "cuda_v2_1",
-            1e-4,
-            1e-4,
-            exact_grads=("v", "q"),
-            loose_grads=("lambda_v", "k", "a", "p"),
-            returns_state=False,
-            supports_initial_state=False,
-            clips_phi=True,
-        ),
-        # Both Metal strategies get the exact-gradient contract. For the fused
-        # one that is the interesting claim: it is the same "one kernel, hand-
-        # written backward" shape as cuda_v2_* above, yet every input is tight,
-        # because a per-step Moebius map has an elementary adjoint where a
-        # trace-normalized prefix product does not.
-        Profile(
-            "mps_recurrent",
-            5e-4,
-            5e-4,
-            exact_grads=INPUT_NAMES,
-            exact_grad_tol=1e-2,
-            scan_form=_LANE_FORM,
-        ),
-        # Composed forward, but the same lane-per-state backward, so it gets the
-        # same exact-gradient contract.
-        Profile(
-            "mps_chunk",
-            1e-3,
-            1e-3,
-            exact_grads=INPUT_NAMES,
-            exact_grad_tol=1e-2,
-        ),
-        # Same composition, resolved across chunks by a parallel scan instead of
-        # a serial carry -- and the same lane-per-state backward again, reading
-        # checkpoints this implementation produces rather than stores.
-        Profile(
-            "mps_pscan",
-            1e-3,
-            1e-3,
-            exact_grads=INPUT_NAMES,
-            exact_grad_tol=1e-2,
-            scan_form=(
-                "composes the same maps per chunk, then resolves the chunks "
-                "with a parallel scan carrying nothing between them"
-            ),
-        ),
-        # The merged Metal cells. Same forwards as the two above with the second
-        # scan removed, and the same lane-per-state backward again -- which is
-        # the claim worth checking here: merging is a property of the forward's
-        # composition, and kla_scan_bwd replays a scalar recurrence from
-        # checkpoints, so it must not be able to tell the difference. Same
-        # tolerances as their two-scan counterparts, deliberately: a merged cell
-        # that needed a looser budget would be a regression, not a variant.
-        Profile(
-            "mps_merged_chunk",
-            1e-3,
-            1e-3,
-            exact_grads=INPUT_NAMES,
-            exact_grad_tol=1e-2,
-            scan_form=_MERGED_FORM,
-        ),
-        Profile(
-            "mps_merged_pscan",
-            1e-3,
-            1e-3,
-            exact_grads=INPUT_NAMES,
-            exact_grad_tol=1e-2,
-            scan_form=(
-                "folds both recurrences into one 3x3 composition per chunk, "
-                "then resolves the chunks with a parallel scan carrying nothing "
-                "between them"
-            ),
-        ),
+        Profile("cuda_fused_chunk", 1e-3, 1e-3, grad_tol=1e-2),
+        Profile("cuda_merged_chunk", 1e-3, 1e-3, grad_tol=1e-2, scan_form=_MERGED_FORM),
+        # mps. The recurrent cell is where the tightness comes from on all three:
+        # applying the Moebius map per step leaves the adjoint elementary, and
+        # the two chunk cells replay from its checkpoints.
+        Profile("mps_fused_recurrent", 5e-4, 5e-4, grad_tol=1e-2, scan_form=_LANE_FORM),
+        Profile("mps_fused_chunk", 1e-3, 1e-3, grad_tol=1e-2),
+        Profile("mps_merged_chunk", 1e-3, 1e-3, grad_tol=1e-2, scan_form=_MERGED_FORM),
     ]
 }
 
@@ -326,7 +142,7 @@ def rel_err(got, ref):
     """Max abs deviation normalized by the reference's own scale.
 
     Gradients of the static ``a``/``p`` accumulate over batch x time, so their
-    absolute magnitude says nothing on its own — normalizing by ``ref`` keeps one
+    absolute magnitude says nothing on its own, normalizing by ``ref`` keeps one
     threshold meaningful across all six inputs.
     """
     return ((got - ref).abs().max() / (ref.abs().max() + 1.0)).item()
@@ -352,17 +168,15 @@ def device_for(backend):
 def report(title, rows, why=None):
     """Print a measurement table and the reading of it, then let the caller assert.
 
-    A pass/fail threshold tells you a backend is inside its documented budget; it
-    does not tell you *where* inside. For the CUDA kernels that distinction
-    matters -- their adjoint is approximate by construction, so the useful
-    question is whether today's deviation is 5 % or 24 % of a 25 % budget, and a
-    green test hides both. Printing also means a failing run shows every input's
-    number rather than stopping at the first one over budget.
+    A pass/fail threshold tells you a backend is inside its budget; it does not
+    tell you *where* inside. That distinction is the whole content of a parity
+    run: a cell sitting at 3% of its budget and one sitting at 97% are the same
+    green dot, and only the second is about to break. Printing also means a
+    failing run shows every input's number rather than stopping at the first one
+    over budget.
 
     ``why`` explains what the numbers mean for *this* backend, derived from the
-    measured values rather than canned. Several of these tests pass for opposite
-    reasons depending on the profile -- v2_1 passes the high-phi test by
-    *deviating* -- so a bare green dot is genuinely ambiguous.
+    measured values rather than canned.
 
     Captured by default; run with ``-s`` (or ``-rA``) to see it:
 
@@ -415,16 +229,11 @@ def test_forward_matches_reference(backend):
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
 def test_final_state_matches_reference(backend):
-    """The carried (lambda, eta) state must match, for backends that return it."""
-    prof = PROFILES[backend]
+    """The carried (lambda, eta) state must match. Every cell returns one."""
     device = device_for(backend)
     inputs = make_inputs(device)
 
     _, _, state = run_backend(backend, inputs)
-    if not prof.returns_state:
-        assert state is None, f"{backend} documents state=None (forward-only kernel)"
-        return
-
     _, _, ref = kla_scan_reference(*inputs)
     torch.testing.assert_close(state.lam, ref.lam, atol=1e-3, rtol=1e-4)
     torch.testing.assert_close(state.eta, ref.eta, atol=1e-3, rtol=1e-4)
@@ -436,8 +245,6 @@ def test_chunked_state_carry(backend):
     prof = PROFILES[backend]
     device = device_for(backend)
     v, lambda_v, k, q, a, p = make_inputs(device)
-    if not prof.supports_initial_state:
-        pytest.skip(f"{backend} does not accept a carried initial state")
 
     y_full, _, _ = run_backend(backend, (v, lambda_v, k, q, a, p))
     mid = v.shape[1] // 2
@@ -473,61 +280,29 @@ def test_backward_matches_reference(backend):
 
     # Measure every input first, print the table, and only then assert. Asserting
     # inside the loop would stop at the first input over budget and hide the rest
-    # -- exactly the inputs you need to see when a kernel change moves the
-    # approximate adjoint.
+    # -- exactly the inputs you need to see when a kernel change moves an adjoint.
+    budget = prof.grad_tol
     rows, over = [], []
     for name, got, ref in zip(INPUT_NAMES, inputs, refs):
         assert got.grad is not None, f"{backend}: no gradient reached {name}"
         assert torch.isfinite(got.grad).all(), f"{backend}: non-finite d{name}"
         err = rel_err(got.grad, ref.grad)
-        loose = name in prof.loose_grads
-        budget = prof.loose_grad_tol if loose else prof.exact_grad_tol
         rows.append(
-            (
-                f"d{name}",
-                err,
-                f"{'loose' if loose else 'exact'}  budget {budget:<7g} "
-                f"using {100 * err / budget:6.2f}%",
-            )
+            (f"d{name}", err, f"budget {budget:<7g} using {100 * err / budget:6.2f}%")
         )
         if err >= budget:
-            over.append(
-                f"d{name} {err:.3e} >= {budget:g} ({'loose' if loose else 'exact'})"
-            )
+            over.append(f"d{name} {err:.3e} >= {budget:g}")
 
-    worst_name, worst_err, _ = max(
-        rows,
-        key=lambda r: (
-            r[1]
-            / (
-                prof.loose_grad_tol
-                if r[0][1:] in prof.loose_grads
-                else prof.exact_grad_tol
-            )
-        ),
-    )
-    worst_budget = (
-        prof.loose_grad_tol
-        if worst_name[1:] in prof.loose_grads
-        else prof.exact_grad_tol
-    )
+    worst_name, worst_err, _ = max(rows, key=lambda r: r[1])
     report(
         f"{backend}: gradient deviation vs the sequential reference",
         rows,
         why=f"""
-        Worst input is {worst_name} at {100 * worst_err / worst_budget:.2f}% of its
-        budget. {
-            "All six gradients are exact adjoints, so anything above ~1e-6 would "
-            "mean a real bug."
-            if not prof.loose_grads
-            else f"The loose group ({', '.join(prof.loose_grads)}) flows through the "
-            "trace-normalized Moebius backward, which is NOT the exact adjoint of the "
-            "forward compose -- a few percent there is the documented contract, not a "
-            f"regression. The exact group ({', '.join(prof.exact_grads)}) rides the "
-            "information-vector and read-out paths, which are exact, so those "
-            "must stay tight."
-        } PASS means every input is inside the budget its own path earns; it
-        does not mean the gradients are correct to float32 -- read the percentages.
+        Worst input is {worst_name} at {100 * worst_err / budget:.2f}% of the budget.
+        All six gradients are exact adjoints -- every cell differentiates the
+        recurrence, whose per-step gain is a scalar -- so anything above ~1e-6
+        would mean a real bug rather than a documented approximation. PASS does
+        not mean the gradients are correct to float32; read the percentages.
         """,
     )
     assert not over, (
@@ -611,14 +386,13 @@ def test_near_zero_decay_stays_finite(backend):
     matrix ``A = (1 + p·φ)/a²`` toward infinity. The scan composes two *raw*
     leaves before the first trace-normalization, so ``A²`` overflows float32
     around ``a² ≈ 5e-20``; the normalizer then computes ``inf/inf`` and NaN
-    poisons the rest of the scan. torch floors ``a²`` at ``EPS``
-    (:mod:`kla.ops.kla_ops`) and v2_2 matches it -- v2_1 divides unguarded.
+    poisons the rest of the scan. Every cell floors ``a²`` at ``EPS``, matching
+    :mod:`kla.ops.kla_ops`.
 
     The floor is semantically inert: ``a_bar = 1e-6`` per step is already total
     forgetting over any horizon, so flooring changes only whether the arithmetic
     stays finite, never what the model computes.
     """
-    prof = PROFILES[backend]
     device = device_for(backend)
     v, lambda_v, k, q, a, p = make_inputs(device)
     a = torch.full_like(a, 1e-10)  # a² = 1e-20, past the float32 overflow point
@@ -638,21 +412,12 @@ def test_near_zero_decay_stays_finite(backend):
         The leaf A = (1+p.phi)/a^2 reaches ~1e20 here, and the scan composes two RAW
         leaves before the first trace-normalization, so A^2 ~ 1e40 overflows float32
         (max 3.4e38); the normalizer then computes inf/inf = NaN. Flooring a^2 at 1e-12
-        caps A at ~1e12, so A^2 ~ 1e24 stays finite. """
-        + (
-            "SKIPPED for v2_1, which divides unguarded by design."
-            if prof.clips_phi
-            else "PASS = 0 nonfinite entries, i.e. the floor is active. It costs "
-            "nothing: a decay of 1e-6 already annihilates the state in one step, "
-            "so flooring changes only whether the arithmetic survives, never what "
-            "the model computes."
-        ),
+        caps A at ~1e12, so A^2 ~ 1e24 stays finite. PASS = 0 nonfinite entries, i.e.
+        the floor is active. It costs nothing: a decay of 1e-6 already annihilates the
+        state in one step, so flooring changes only whether the arithmetic survives,
+        never what the model computes.""",
     )
 
-    # clips_phi marks v2_1, which carries *both* unguarded paths -- the phi
-    # ceiling and this unfloored 1/a². Rename the flag if a third one shows up.
-    if prof.clips_phi:
-        pytest.skip("v2_1 divides by an unfloored a² by design")
     assert torch.isfinite(y).all(), f"{backend}: non-finite y at a=1e-10"
     assert torch.isfinite(y_var).all(), f"{backend}: non-finite y_var at a=1e-10"
 
@@ -661,71 +426,46 @@ def test_near_zero_decay_stays_finite(backend):
 def test_high_information_tokens_are_not_clipped(backend):
     """A large per-token information gain must not be capped by any backend.
 
-    ``phi = Λ^v·k²`` is how much one observation sharpens the precision. ``v2_1``
-    caps it at 1000 (``compute_phi_r``) while leaving ``r = v·Λ^v·k`` uncapped --
-    but ``mean = r/phi`` only equals ``v/k`` because ``Λ^v`` cancels between the
-    two, so a token saturating by ``ρ = phi/1000`` comes out with its mean *and*
-    its variance scaled by ``ρ``. Under the layer defaults phi reaches
-    ``1/obs_var_min = 1e4``, so that cap sits inside the operating range, not
-    above it -- yet :func:`make_inputs` keeps phi ~0.1 and never trips it. These
-    inputs do.
+    ``phi = Λ^v·k²`` is how much one observation sharpens the precision, and it
+    must reach the scan unbounded: ``mean = r/phi`` only equals ``v/k`` because
+    ``Λ^v`` cancels between ``phi`` and ``r = v·Λ^v·k``, so any ceiling on one
+    and not the other scales a saturated token's mean *and* its variance by the
+    saturation ratio. Under the layer defaults phi reaches ``1/obs_var_min =
+    1e4``, well inside the operating range, yet :func:`make_inputs` keeps phi
+    ~0.1 and would never notice a cap. These inputs would.
     """
-    prof = PROFILES[backend]
     device = device_for(backend)
     v, lambda_v, k, q, a, p = make_inputs(device)
     lambda_v = lambda_v * 1e4  # Λ^v up to ~1e4, matching obs_var_min = 1e-4
     phi_max = (lambda_v.unsqueeze(-1) * (k * k).unsqueeze(-2)).max().item()
-    assert phi_max > 1e3, f"inputs never reach the v2_1 ceiling (phi_max={phi_max:g})"
+    assert phi_max > 1e3, f"inputs never reach the tested regime (phi_max={phi_max:g})"
 
     y, y_var, _ = run_backend(backend, (v, lambda_v, k, q, a, p))
     y_ref, y_var_ref, _ = kla_scan_reference(v, lambda_v, k, q, a, p)
     err_y, err_var = rel_err(y, y_ref), rel_err(y_var, y_var_ref)
 
-    rho = phi_max / 1e3
-    verdict = "clipping kernel — deviation REQUIRED" if prof.clips_phi else "must match"
     report(
-        f"{backend}: high-phi deviation ({verdict})",
+        f"{backend}: high-phi deviation (must match)",
         [
-            ("max phi", phi_max, f"ceiling 1e3, so up to {rho:.1f}x saturation"),
+            ("max phi", phi_max, "unbounded by contract"),
             ("rel|dy|", err_y, "posterior mean"),
             ("rel|dy_var|", err_var, "posterior variance"),
         ],
         why=f"""
-        phi = Lambda^v.k^2 is one token's information gain. v2_1 caps it at 1000 in the
-        lambda recursion but leaves r = (v.Lambda^v).k uncapped -- and mean = r/phi only
-        equals v/k because Lambda^v cancels between them, so a saturated token has BOTH
-        its mean and its variance inflated by rho = phi/1000, here up to {rho:.1f}x.
-        """
-        + (
-            f"""
-        This backend PASSES BY DEVIATING ({max(err_y, err_var):.2e} > 5e-3): that
-        confirms its clamp is still engaging. A pass in the other direction would mean
-        v2_1 had silently stopped clipping -- which is why the assertion is inverted
-        here rather than skipped.
-        """
-            if prof.clips_phi
-            else f"""
-        This backend matches the reference to {max(err_y, err_var):.1e} at
-        {rho:.1f}x past where v2_1 clips, so PASS means the ceiling is genuinely gone
-        and the Lambda^v cancellation is intact.
-        """
-        ),
+        phi = Lambda^v.k^2 is one token's information gain. Capping it in the lambda
+        recursion while leaving r = (v.Lambda^v).k uncapped breaks the cancellation
+        that makes mean = r/phi equal v/k, and inflates BOTH the mean and the variance
+        of a saturated token. This backend matches the reference to
+        {max(err_y, err_var):.1e} at phi_max={phi_max:g}, so PASS means no such
+        ceiling is present and the Lambda^v cancellation is intact.
+        """,
     )
 
-    # Clipping shows up as an O(ρ) deviation, far above float32 scan noise.
-    if prof.clips_phi:
-        assert err_y > 5e-3 or err_var > 5e-3, (
-            f"{backend} is the clipping kernel and must still deviate here "
-            f"(y {err_y:.2e}, y_var {err_var:.2e} at phi_max={phi_max:g}) -- if this "
-            "passes, v2_1's phi ceiling is no longer engaging"
-        )
-    else:
-        assert err_y < 5e-3, (
-            f"{backend}: y deviates at phi_max={phi_max:g} ({err_y:.2e})"
-        )
-        assert err_var < 5e-3, (
-            f"{backend}: y_var deviates at phi_max={phi_max:g} ({err_var:.2e})"
-        )
+    # A ceiling shows up as an O(1) deviation, far above float32 scan noise.
+    assert err_y < 5e-3, f"{backend}: y deviates at phi_max={phi_max:g} ({err_y:.2e})"
+    assert err_var < 5e-3, (
+        f"{backend}: y_var deviates at phi_max={phi_max:g} ({err_var:.2e})"
+    )
 
 
 # ------------------------------------------------------- fused triton kernel
@@ -927,21 +667,22 @@ def test_mps_threadgroup_geometry(backend, S, M):
 
 
 @needs_mps
-@pytest.mark.parametrize("backend", ["mps_chunk", "mps_pscan"])
+@pytest.mark.parametrize("backend", ["mps_fused_chunk", "mps_merged_chunk"])
 @pytest.mark.parametrize("L", [CHUNK, 100])
 def test_mps_strategies_agree(backend, L):
     """The three Metal implementations must agree.
 
-    They share no forward kernel -- ``mps_recurrent`` applies the Moebius map
-    down B*M*S serial lanes, ``mps_chunk`` composes it with time as a parallel
-    axis and carries across tiles, ``mps_pscan`` composes it per chunk and
-    carries nothing -- so this is an independent cross-check of all three,
-    reaching the same numbers by different routes. The composed routes carry
-    more rounding, hence the looser budget than any has against the reference.
+    They share no forward kernel -- ``mps_fused_recurrent`` applies the Moebius map
+    down B*M*S serial lanes, ``mps_fused_chunk`` composes it with time as a parallel
+    axis and carries across tiles, ``mps_merged_chunk`` composes a 3x3 map that
+    carries eta in the same coordinates -- so this is an independent cross-check
+    of all three, reaching the same numbers by different routes. The composed
+    routes carry more rounding, hence the looser budget than any has against the
+    reference.
     """
     inputs = make_inputs("mps", L=L)
     with torch.no_grad():
-        yr, vr, sr = kla_scan(*inputs, backend="mps_recurrent")
+        yr, vr, sr = kla_scan(*inputs, backend="mps_fused_recurrent")
         yc, vc, sc = kla_scan(*inputs, backend=backend)
     torch.testing.assert_close(yc, yr, atol=1e-3, rtol=1e-3)
     torch.testing.assert_close(vc, vr, atol=1e-3, rtol=1e-3)
@@ -954,12 +695,11 @@ def test_mps_strategies_agree(backend, L):
 def test_mps_state_gradient_flows(backend):
     """Gradients must flow *through* the returned filter state, not stop at it.
 
-    This is the one the CUDA kernel cannot do at all -- it returns ``None`` for
-    the state and is training-only for that reason. Both Metal backends carry
-    ``lam0``/``eta0`` in and hand the final state back inside the graph, which
-    is what makes truncated BPTT over chunked sequences work. A backward that
-    merely ignored the incoming state gradient would still pass every other test
-    in this file, so it needs its own: the loss here reads *only* the state.
+    Every Metal cell carries ``lam0``/``eta0`` in and hands the final state back
+    inside the graph, which is what makes truncated BPTT over chunked sequences
+    work. A backward that merely ignored the incoming state gradient would still
+    pass every other test in this file, so it needs its own: the loss here reads
+    *only* the state.
     """
     inputs = make_inputs("mps", L=CHUNK + 5, requires_grad=True)
     refs = tuple(t.detach().cpu().clone().requires_grad_(True) for t in inputs)
@@ -1010,7 +750,7 @@ def test_mps_chunk_forward(L, S):
     refs = tuple(t.cpu() for t in inputs)
 
     with torch.no_grad():
-        y, y_var, state = kla_scan(*inputs, backend="mps_chunk")
+        y, y_var, state = kla_scan(*inputs, backend="mps_fused_chunk")
     y_ref, y_var_ref, ref_state = kla_scan_reference(*refs)
 
     torch.testing.assert_close(y.cpu(), y_ref, atol=5e-4, rtol=5e-4)
@@ -1021,17 +761,17 @@ def test_mps_chunk_forward(L, S):
 
 @needs_mps
 def test_mps_chunk_backward_is_the_recurrent_kernel():
-    """``mps_chunk``'s adjoint does not mirror its forward, and must not.
+    """``mps_fused_chunk``'s adjoint does not mirror its forward, and must not.
 
     The forward *composes* the Moebius maps to make time parallel; the backward
     replays from the checkpoints it wrote and walks a scalar reverse recurrence
-    down the serial state lanes -- the same kernel ``mps_recurrent`` uses. So
+    down the serial state lanes -- the same kernel ``mps_fused_recurrent`` uses. So
     the two must agree to far better than either's budget against the
     reference: the checkpoints are the only thing passing between them, and a
     stride or index mismatch would show up here first.
     """
     grads = []
-    for backend in ("mps_recurrent", "mps_chunk"):
+    for backend in ("mps_fused_recurrent", "mps_fused_chunk"):
         inputs = make_inputs("mps", L=100, requires_grad=True)
         y, y_var, _ = kla_scan(*inputs, backend=backend)
         (y.square().sum() + y_var.sum()).backward()
@@ -1052,41 +792,10 @@ def test_mps_chunk_checkpoints_span_every_length(L):
     """
     inputs = make_inputs("mps", L=L, requires_grad=True)
     refs = tuple(t.detach().cpu().clone().requires_grad_(True) for t in inputs)
-    y, y_var, _ = kla_scan(*inputs, backend="mps_chunk")
+    y, y_var, _ = kla_scan(*inputs, backend="mps_fused_chunk")
     (y.square().sum() + y_var.sum()).backward()
     y_ref, y_var_ref, _ = kla_scan_reference(*refs)
     (y_ref.square().sum() + y_var_ref.sum()).backward()
-    for name, got, ref in zip(INPUT_NAMES, inputs, refs):
-        err = rel_err(got.grad.cpu(), ref.grad)
-        assert err < 1e-2, f"L={L}: d{name} off by {err:.2e}"
-
-
-@needs_mps
-@pytest.mark.parametrize(
-    "L", [1, CHUNK, CHUNK + 1, 3 * CHUNK - 7, 5 * CHUNK, 17 * CHUNK]
-)
-def test_mps_pscan_doubling_depth(L):
-    """``mps_pscan`` resolves its chunks across launches, so the depth is data.
-
-    The other two forwards carry state from one tile to the next inside a single
-    dispatch. This one runs ``ceil(log2(NCK))`` doubling rounds over the chunk
-    aggregates, ping-ponging two buffers -- so the round count, which buffer
-    holds the answer at the end, and the ``c < off`` pass-through are all
-    functions of the sequence length. The lengths here give NCK of 1, 1, 2, 3, 5
-    and 17: a scan with no rounds at all, powers of two, and the odd counts
-    where the last round only touches part of the axis.
-    """
-    inputs = make_inputs("mps", B=2, L=L, M=3, S=8, requires_grad=True)
-    refs = tuple(t.detach().cpu().clone().requires_grad_(True) for t in inputs)
-
-    y, y_var, state = kla_scan(*inputs, backend="mps_pscan")
-    (y.square().sum() + y_var.sum()).backward()
-    y_ref, y_var_ref, ref_state = kla_scan_reference(*refs)
-    (y_ref.square().sum() + y_var_ref.sum()).backward()
-
-    torch.testing.assert_close(y.cpu(), y_ref, atol=5e-4, rtol=5e-4)
-    torch.testing.assert_close(y_var.cpu(), y_var_ref, atol=5e-4, rtol=5e-4)
-    torch.testing.assert_close(state.lam.cpu(), ref_state.lam, atol=1e-3, rtol=1e-3)
     for name, got, ref in zip(INPUT_NAMES, inputs, refs):
         err = rel_err(got.grad.cpu(), ref.grad)
         assert err < 1e-2, f"L={L}: d{name} off by {err:.2e}"
@@ -1131,7 +840,7 @@ def test_mps_auto_does_not_route_around_the_d_state_ceiling():
     from kla.ops.kernels.mps import MAX_DSTATE
 
     wide = make_inputs("mps", B=1, L=8, M=2, S=MAX_DSTATE + 1)
-    for backend in ("auto", "mps", "mps_recurrent", "mps_chunk"):
+    for backend in ("auto", "mps", "mps_fused_recurrent", "mps_fused_chunk"):
         with pytest.raises(NotImplementedError, match="d_state") as excinfo:
             kla_scan(*wide, backend=backend)
         assert "torch" in str(excinfo.value)

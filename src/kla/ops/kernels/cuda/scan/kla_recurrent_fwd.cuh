@@ -1,12 +1,12 @@
 /******************************************************************************
- * cuda_recurrent -- the forward, one thread per (b, m, s), time serial.
+ * cuda_fused_recurrent -- the forward, one thread per (b, m, s), time serial.
  *   kla_recurrent_fwd.cuh
  *
  * The Moebius map is *applied* to a running lambda rather than composed with
  * its neighbours, so there is no 2x2 matrix, no trace normalization and no
  * overflow path. Parallelism comes from B*M*S lanes, which is plenty whenever
  * there are sequences or channels to spend -- decode, and training at any real
- * batch size. cuda_chunk is the one to reach for when there are not.
+ * batch size. cuda_fused_chunk is the one to reach for when there are not.
  *
  * Checkpoints. Every KLA_CHUNK steps the thread writes the (lambda, eta) it is
  * *about to* consume into [B, M, NCK, S]. kla_scan_bwd.cuh resumes from exactly

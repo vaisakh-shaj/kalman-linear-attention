@@ -1,5 +1,5 @@
 /******************************************************************************
- * mps_chunk -- the forward, time as a *parallel* axis.
+ * mps_fused_chunk -- the forward, time as a *parallel* axis.
  *   chunk_kla_scan.metal
  *
  * For the case the lane-per-state kernel cannot fill: batch-1 prefill, where
@@ -18,7 +18,7 @@
  * Cost. Parallelizing over time forces *composition*: a thread cannot apply the
  * Moebius map without already knowing the running lambda, which is the serial
  * dependency itself. So each element is composed once (phase A) and applied
- * once (phase C) rather than applied once — about 4x the arithmetic of
+ * once (phase C) rather than applied once, about 4x the arithmetic of
  * recurrent_kla_scan.metal, bought in exchange for KLA_ROWS times the parallelism.
  * Walking KLA_ITEMS steps serially per thread is what keeps it at 4x rather
  * than the log(tile) composes a pure Hillis-Steele scan over timesteps costs.
@@ -235,7 +235,7 @@ kernel void kla_chunk_fwd(
             r_h[i] = r_t;
         }
         // The last thread holds lambda at the tile boundary (or at L, if the
-        // sequence ended inside this tile — later threads then never updated).
+        // sequence ended inside this tile, later threads then never updated).
         carry_lam = kla_tile_broadcast(lam, bcast_s, s, ty);
 
         // -- D/E: the same two steps for the affine recurrence, which could not

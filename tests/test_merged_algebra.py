@@ -271,9 +271,8 @@ def test_reconstructing_D_is_not_free():
     """Why the carried map is seven values and not six.
 
     After a combine A + D = 1, so D looks redundant, and dropping it would put
-    the merged aggregate at 24 bytes -- exactly what the two-scan pair costs, and
-    the difference between a wash and a regression for ``mps_merged_pscan``,
-    whose doubling rounds are bandwidth-bound on precisely this array.
+    the merged map at 24 bytes -- exactly what the two-scan pair costs, which
+    matters wherever the scan is bandwidth- rather than arithmetic-bound.
 
     It does not work, and not marginally. D is the *small* entry (roughly
     a²/(1+pφ)), so recovering it as 1 - A gives it an absolute error of one ulp

@@ -1,5 +1,5 @@
 /******************************************************************************
- * mps_recurrent -- the forward, one thread per (b, m, s), time serial.
+ * mps_fused_recurrent -- the forward, one thread per (b, m, s), time serial.
  *   recurrent_kla_scan.metal
  *
  * The whole forward in one kernel, with no [B,L,M,S] intermediate ever reaching
@@ -93,7 +93,7 @@ kernel void kla_recurrent_fwd(
         const float denom = fmax(a2 + p_s * lam_prev, KLA_EPS);
         eta = (a_s / denom) * eta + msi_t * k_t;
 
-        // The filtered posterior, then optionally one predict step ahead of it —
+        // The filtered posterior, then optionally one predict step ahead of it,
         // the same transform the torch path applies after its scan.
         const float var_f = 1.0f / fmax(lam, KLA_EPS);
         const float mean_f = eta * var_f;

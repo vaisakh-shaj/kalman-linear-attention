@@ -1,15 +1,11 @@
 """Triton kernels for the KLA scan.
 
-Two families, matching the two halves of the naming scheme (see
-``docs/implementations.md``):
+Three fused forwards, ``recurrent_kla_scan``, ``chunk_kla_scan`` and
+``merged_chunk_kla_scan``, one kernel each with no ``[B, L, M, S]``
+intermediate, plus ``kla_scan_bwd``, the one exact backward all three share.
+See ``docs/implementations.md`` for what the names mean and ``_tuning`` for the
+launch constants they take.
 
-- ``recurrent_kla_scan``, ``chunk_kla_scan``, ``pscan_kla_scan`` — the fused
-  cells, one kernel each with no ``[B, L, M, S]`` intermediate, plus
-  ``kla_scan_bwd``, the one exact backward all three share.
-- ``unfused_kla_scan`` — the standalone λ and η scans behind the unfused cells,
-  three implementations each over already-built leaf coefficients, with torch glue
-  around them and one exact backward again.
-
-Do not import this package eagerly from portable code paths — the modules
+Do not import this package eagerly from portable code paths, the modules
 import ``triton`` at module level.
 """

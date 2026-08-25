@@ -1,8 +1,8 @@
 /******************************************************************************
- * cuda_chunk -- the forward, time as a *parallel* axis.
+ * cuda_fused_chunk -- the forward, time as a *parallel* axis.
  *   kla_chunk_fwd.cuh
  *
- * For the case cuda_recurrent cannot fill: batch-1 prefill, where B*M*S alone
+ * For the case cuda_fused_recurrent cannot fill: batch-1 prefill, where B*M*S alone
  * leaves the GPU short of threads.
  *
  * One block owns one (batch, channel) pair and streams the sequence in tiles of

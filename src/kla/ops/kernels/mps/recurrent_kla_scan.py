@@ -1,9 +1,9 @@
-"""``mps_recurrent`` — the whole scan in one kernel, time serial.
+"""``mps_fused_recurrent``, the whole scan in one kernel, time serial.
 
 Sufficient statistics, both recurrences and the read-out in one kernel, so no
 ``[B, L, M, S]`` intermediate is ever written. The Möbius map is *applied* to a
 running λ rather than composed, which is what leaves the adjoint elementary; the
-backward is :mod:`kla.ops.kernels.mps.kla_scan_bwd`, shared with ``mps_chunk``.
+backward is :mod:`kla.ops.kernels.mps.kla_scan_bwd`, shared with ``mps_fused_chunk``.
 
 ``d_state`` is capped at :data:`~kla.ops.kernels.mps._shaders.MAX_DSTATE`. The
 replay scheme, reduction layout and atomics are described in the headers of
@@ -52,7 +52,7 @@ def recurrent_forward(
 
     ``y`` / ``y_var`` are ``[B, L, M]``; the state tensors are ``[B, M, S]``.
     With ``checkpoints=False`` the two checkpoint tensors are one-element
-    placeholders — the kernel takes the flag and never writes them. ``prior``
+    placeholders, the kernel takes the flag and never writes them. ``prior``
     is ``decode_from_prior``: it moves the read-out one predict step ahead.
     """
     check_inputs(msi, si, k, q, a, p, lam0, eta0)

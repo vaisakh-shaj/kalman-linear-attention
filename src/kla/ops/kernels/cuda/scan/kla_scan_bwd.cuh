@@ -4,16 +4,17 @@
  *
  * An adjoint does not have to mirror its forward. All this kernel needs is
  * (lambda, eta) at the checkpoints; whether the forward walked time serially,
- * tiled it, or scanned it changes nothing here. So cuda_recurrent, cuda_chunk
- * and cuda_pscan share this one backward, exactly as the Metal and triton
- * kernels share theirs.
+ * tiled it, or folded both recurrences into one map changes nothing here. So
+ * cuda_fused_recurrent, cuda_fused_chunk and cuda_merged_chunk share this one backward,
+ * exactly as the Metal and triton kernels share theirs.
  *
- * Why this is not the v2_* backward. That one differentiates the trace-
- * normalized *composition*: a 4-component adjoint carried through a chain of
- * 4x4 Jacobians, ~64 MACs and 16 floats of shared memory per thread per step.
- * The composed matrix degenerates toward rank-1, so that carry is
- * ill-conditioned in float32 even though the forward -- a scale-invariant ratio
- * of the same matrix -- is not, which is where its 5-15% comes from.
+ * Why it differentiates the recurrence and not the composition. Differentiating
+ * the trace-normalized *composition* means a 4-component adjoint carried
+ * through a chain of 4x4 Jacobians, ~64 MACs and 16 floats of shared memory per
+ * thread per step. The composed matrix degenerates toward rank-1, so that carry
+ * is ill-conditioned in float32 even though the forward -- a scale-invariant
+ * ratio of the same matrix -- is not; measured against a float64 reference it
+ * comes out 5-15% wrong on the gradients that flow through the precision scan.
  * Differentiating the *recurrence* instead gives a scalar gain
  *
  *     d lambda_t / d lambda_{t-1} = a^2/den_t^2

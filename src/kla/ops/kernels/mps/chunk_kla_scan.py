@@ -1,4 +1,4 @@
-"""``mps_chunk`` — the scan on Metal with time as a parallel axis.
+"""``mps_fused_chunk``, the scan on Metal with time as a parallel axis.
 
 The counterpart of :mod:`kla.ops.kernels.mps.recurrent_kla_scan` for the shapes
 that one cannot fill. A threadgroup owns a ``(batch, channel)`` pair and splits
@@ -8,8 +8,8 @@ nowhere else; see the header of ``chunk_kla_scan.metal`` for the phases and for
 why the extra parallelism costs about 4x the arithmetic.
 
 The backward is :func:`~kla.ops.kernels.mps.kla_scan_bwd.scan_backward`, shared
-with ``mps_recurrent``. An adjoint does not have to mirror its forward: it
-recovers λ from the checkpoints this forward writes — same layout, same stride —
+with ``mps_fused_recurrent``. An adjoint does not have to mirror its forward: it
+recovers λ from the checkpoints this forward writes, same layout, same stride,
 then walks a *scalar* reverse recurrence down the serial state lanes, which is
 the same work whichever forward got there. So the gradients are exact, at the
 tight tolerance, with no composed-map Jacobian anywhere.
@@ -30,7 +30,7 @@ from kla.ops.kernels.mps.kla_scan_bwd import scan_backward
 
 
 def _grid(B: int, M: int, S: int):
-    """``(threads, group_size)`` — one threadgroup per ``(batch, channel)``."""
+    """``(threads, group_size)``, one threadgroup per ``(batch, channel)``."""
     block_s, rows = tile_geometry(S)
     return (block_s, rows * M, B), (block_s, rows, 1)
 
@@ -52,7 +52,7 @@ def chunk_forward(
     """Chunk forward. Returns ``(y, y_var, lam_fin, eta_fin, lam_ck, eta_ck)``.
 
     With ``checkpoints=False`` the two checkpoint tensors are one-element
-    placeholders — the kernel takes the flag and never writes them.
+    placeholders, the kernel takes the flag and never writes them.
     """
     check_inputs(msi, si, k, q, a, p, lam0, eta0)
     B, L, M = msi.shape

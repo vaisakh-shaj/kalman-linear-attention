@@ -27,8 +27,22 @@
 #define KLA_EPS 1e-12f
 #define KLA_MAX_DSTATE 64
 #define KLA_TG_THREADS 256
-#define KLA_CHUNK 16  // checkpoint stride; also the replay buffers' depth
-#define KLA_ITEMS 8   // timesteps each thread of cuda_chunk walks serially
+
+// The two tuning constants. Guarded so a build can override them with -D
+// without editing this file: kla.ops.cuda_backend reads KLA_CUDA_CHUNK and
+// KLA_CUDA_ITEMS from the environment and passes them through, which is what
+// drives the sweeps behind docs/benchmarks/cuda.md. The defaults below are the
+// values that sweep settled on: KLA_ITEMS=8 was already optimal, and KLA_CHUNK
+// is 8 because the register pressure in the backward's replay buffers wants it
+// there. It sat at 16 only as a compromise with cuda_pscan, which wanted 64 for
+// its aggregate bandwidth; with that cell gone the compromise went with it and
+// this is worth ~5% on a whole-layer training step, for twice the checkpoints.
+#ifndef KLA_CHUNK
+#define KLA_CHUNK 8   // checkpoint stride; also the replay buffers' depth
+#endif
+#ifndef KLA_ITEMS
+#define KLA_ITEMS 8   // timesteps each thread of cuda_fused_chunk walks serially
+#endif
 //
 // KLA_CHUNK and KLA_ITEMS are independent and must stay so. One is where the
 // backward resumes; the other is how deep one thread of the chunk forward
@@ -56,9 +70,10 @@ __device__ __forceinline__ float kla_lambda_step(float lam_prev, float phi, floa
 
 // ------------------------------------------------------- 2x2 Moebius algebra
 //
-// Here rather than beside the one kernel that composes, because cuda_chunk and
-// cuda_pscan both compose and must compose identically -- two copies of a trace
-// normalization is two things to drift.
+// Here rather than beside the one kernel that composes, because cuda_fused_chunk
+// composes 2x2 maps and cuda_merged_chunk composes the 2x2 block of a 3x3 one,
+// and they must normalize identically -- two copies of a trace normalization is
+// two things to drift.
 //
 // Same representation and the same trace normalization as the torch reference
 // (kla.ops.kla_ops._mobius_combine_tracenorm) and the triton kernels:
@@ -140,3 +155,4 @@ __device__ __forceinline__ int kla_ck(int b, int m, int c, int s, int M, int NCK
                                       int S) {
     return ((b * M + m) * NCK + c) * S + s;
 }
+

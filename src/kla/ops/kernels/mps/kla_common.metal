@@ -1,5 +1,5 @@
 /******************************************************************************
- * KLA Metal kernels — shared prelude
+ * KLA Metal kernels, shared prelude
  *   kla_common.metal
  *
  * Prepended to every KLA shader by :mod:`kla.ops.kernels.mps._shaders`, which
@@ -13,15 +13,15 @@
  * ``(batch b, channel m, state s)`` triple and walks the sequence serially,
  * with ``thread_position_in_grid`` = ``(s, m, b)``. A threadgroup is
  * ``[KLA_BLOCK_S, KLA_ROWS]``, so the ``KLA_BLOCK_S`` lanes of one row hold
- * every state of one channel — which is what makes the read-out sum over ``s``
+ * every state of one channel, which is what makes the read-out sum over ``s``
  * a lane reduction rather than a second kernel.
  *
  * Two reductions follow from that layout, and both are used by the
  * kernels only (the composed scans are pure elementwise-in-(b,m,s)):
  *
- *   kla_sum_over_states    along x — the read-out y = sum_s q.mean, and the
+ *   kla_sum_over_states    along x, the read-out y = sum_s q.mean, and the
  *                          d(v.Lambda^v) / d(Lambda^v) gradients.
- *   kla_sum_over_channels  along y — the d(k) / d(q) gradients, which contract
+ *   kla_sum_over_channels  along y, the d(k) / d(q) gradients, which contract
  *                          over m rather than s.
  *
  * A row of KLA_BLOCK_S lanes sits inside one SIMD-group whenever
@@ -34,7 +34,7 @@
  * Both helpers must be called by *every* thread in the group, including the
  * padding threads at s >= d_state or m >= d_inner: the shuffles need a full
  * SIMD-group and the threadgroup path has barriers in it. So no kernel here
- * returns early — out-of-range threads load neutral values and skip only their
+ * returns early, out-of-range threads load neutral values and skip only their
  * stores.
  ******************************************************************************/
 

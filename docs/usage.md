@@ -1,13 +1,12 @@
 # Usage
 
-`KLALayer` is a sequence mixer.
-It takes `[B, L, d_model]` and returns `[B, L, d_model]`,
-so it drops into any place an attention layer goes.
+`KLALayer` is a sequence mixer. It takes `[B, L, d_model]` and returns
+`[B, L, d_model]`, so it drops into any place an attention layer goes.
 
 <img src="figures/kla_block_scaffold.png" alt="KLA inside a gated linear attention block" width="200">
 
-`KLALayer` is the whole block — the projections, causal conv and gate around the
-filter are already inside it.
+It is the whole block: the projections, causal conv and gate around the filter
+are already inside it.
 
 ```python
 import torch
@@ -17,27 +16,19 @@ layer = KLALayer(d_model=512, config=KLAConfig(d_state=16))
 y = layer(torch.randn(2, 1024, 512))  # [2, 1024, 512]
 ```
 
-`d_model` is a constructor argument; everything else lives on `KLAConfig`.
-Omitting the config gives you the published defaults.
+`d_model` is a constructor argument, everything else lives on `KLAConfig`.
+Omitting the config gives the published defaults.
 
 ## The two knobs that matter
 
-```python
-KLAConfig(d_state=16)  # and d_model, which you pass to the layer
-```
+| knob | what it does | typical |
+| --- | --- | --- |
+| `d_model` | model width | 128 to 4096 |
+| `d_state` | filter state size per channel | 8 to 64 |
 
-| knob      | what it does                  | typical    |
-| --------- | ----------------------------- | ---------- |
-| `d_model` | model width                   | 128 - 4096 |
-| `d_state` | filter state size per channel | 8 - 64     |
-
-`d_state` is the one specific to KLA: how much the filter remembers. Memory and
-compute scale linearly in it, and 16 is a good default. Below 8 the filter starts
-to degenerate; above 64 you rarely gain. (64 is also the ceiling for the CUDA
-kernels and 128 for the Metal ones; torch has none. The read-out sums over the
-state axis, so all of a channel's states have to sit in one block.)
-
-Everything else has a sensible default.
+`d_state` is how much the filter remembers. Memory and compute scale linearly in
+it, and 16 is a good default. Some backends cap it; see
+[implementations.md](implementations.md).
 
 ## Stateful decode
 
@@ -50,21 +41,15 @@ y, state = layer(torch.randn(2, 1024, 512), state=state)  # prefill
 y, state = layer(torch.randn(2, 1, 512), state=state)  # decode one token
 ```
 
-Without a state it returns the tensor alone, which is why the plain call above
-does not unpack.
-
 ## Uncertainty
 
-KLA carries a belief, not a point estimate, so it can hand you the propagated
+KLA carries a belief, not a point estimate, so it can return the propagated
 per-token, per-channel variance alongside the output:
 
 ```python
 layer = KLALayer(d_model=512, config=KLAConfig(return_variance=True))
 y, y_var = layer(torch.randn(2, 1024, 512))  # both [2, 1024, 512]
 ```
-
-`return_variance` changes `out` from `y` to `(y, y_var)`. Combined with a state
-that becomes `((y, y_var), new_state)`.
 
 Set `decode_from_prior=True` to emit the one-step-ahead prior prediction instead
 of the filtered posterior.
@@ -82,14 +67,10 @@ logits = model(torch.randint(0, 50304, (2, 256)))  # [2, 256, 50304]
 ```
 
 `SequenceModel` is embedding + N blocks (mixer, optionally followed by an MLP) +
-LM head. `ModelConfig` carries `vocab_size`, `d_model`, `n_layers`, `mlp`
-(`"swiglu"` / `"gelu"` / `"none"`), `mlp_ratio`, `norm_eps`, `tie_embeddings`,
-and an optional `logit_softcap`.
+LM head.
 
-### Other mixers
-
-The block stack is generic over its sequence mixer. Register a config type
-against a builder and `SequenceModel` will use it:
+The block stack is generic over its sequence mixer, so a baseline comparison is a
+config swap:
 
 ```python
 from kla import register_mixer
@@ -98,27 +79,15 @@ register_mixer(MyMixerConfig, lambda d_model, cfg: MyMixer(d_model, cfg))
 model = SequenceModel(ModelConfig(...), MyMixerConfig(...))
 ```
 
-That is what makes baseline comparisons a config swap rather than a fork.
-
 ## The two published blocks
 
-Two config presets, differing only in how the sensor path is shaped. Neither
-touches the scan — both emit the same tensors, so no backend or kernel changes.
+Two presets, differing only in how the sensor path is shaped. Neither touches the
+scan.
 
 ```python
 KLAConfig(value_rank="full", var_rank="full")  # plain block (the default)
 KLAConfig(value_rank="conv", var_rank="dt")  # mamba block
 ```
-
-`value_rank` controls how the value `v` is produced from the post-conv stream.
-It is the most expensive projection in the layer: `"full"` costs `M²` per block,
-`"conv"` (v = z, Mamba's move) costs nothing. `var_rank` does the same for the
-observation noise, and low-ranking *that* is the safe one — it is a smooth
-per-channel noise level, exactly what Mamba does to `Δ`.
-
-A rank only *saves* when `2*rank < d_inner`: the bottleneck costs two projections
-where the full map costs one. Solve for it against a parameter budget rather than
-picking one by eye. `"dt"` means `dt_rank`, defaulting to `ceil(d_model / 8)`.
 
 Quality is comparable, so pick on parameter budget: at `d_model=512` the mamba
 block is 1.79M parameters against plain's 3.76M. The paper uses plain for the MAD
@@ -138,9 +107,6 @@ time-invariant discrete decay `a` and process noise `p` (`[M, S]`). All three
 return `(y, y_var, final_state)`.
 
 `kla_scan` is the dispatcher. `backend=` takes an implementation name
-(`"mps_pscan"`), a bare backend name for that backend's default (`"mps"`), or
-`"auto"`; see [implementations.md](implementations.md) for the naming scheme.
-`mobius_impl=` is a torch-only knob for how the precision map is represented
-while it is composed. `kla_step` is one recurrent step for decode.
-`kla_scan_reference` is the sequential loop every implementation is validated
-against.
+(`"mps_merged_chunk"`), a bare backend name (`"mps"`), or `"auto"`.
+`kla_step` is one recurrent step for decode. `kla_scan_reference` is the
+sequential loop every implementation is validated against.

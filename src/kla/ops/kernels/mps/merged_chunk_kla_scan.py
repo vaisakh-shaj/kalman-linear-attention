@@ -1,10 +1,10 @@
-"""``mps_merged_chunk`` — ``mps_chunk``'s six phases in three, one scan not two.
+"""``mps_merged_chunk``, ``mps_fused_chunk``'s six phases in three, one scan not two.
 
 Identical in shape to :mod:`kla.ops.kernels.mps.chunk_kla_scan`: same
 threadgroup per ``(batch, channel)``, same tiles of ``ROWS * ITEMS`` timesteps,
 same grid, same checkpoints, same backward. The difference is entirely inside
 the tile. That kernel composes a 2x2 Möbius map for λ, walks it to produce λ,
-then builds the affine leaves ``(α, r)`` that walk unlocked and scans *those* —
+then builds the affine leaves ``(α, r)`` that walk unlocked and scans *those*,
 because α_t reads λ_{t-1}, so the second set of leaves cannot exist any earlier.
 This one composes the 3x3 map of ``kla_merged.metal``, which carries η in the
 same homogeneous coordinates, so its leaf depends on ``(φ, r, a, p)`` alone and
@@ -13,14 +13,14 @@ one scan does both.
 What that buys, concretely: one threadgroup scan instead of two (each is
 ``log2(ROWS)`` Hillis-Steele rounds with two barriers apiece), one broadcast
 instead of two, and the disappearance of the ``var_h``/``alpha_h``/``r_h``
-per-thread arrays that existed only to carry one phase's output to another —
+per-thread arrays that existed only to carry one phase's output to another,
 24 registers at ``ITEMS=8``, on the kernel whose entire reason to exist is
 occupancy.
 
 The backward is :func:`~kla.ops.kernels.mps.kla_scan_bwd.scan_backward`,
 unchanged, shared with every other MPS cell. It replays a scalar recurrence from
 ``[B, M, NCK, S]`` checkpoints and never sees a composed map, so merging the
-forward is invisible to it — see ``tests/test_backends.py``, which holds it to
+forward is invisible to it, see ``tests/test_backends.py``, which holds it to
 the same exact-gradient contract as the rest.
 """
 
@@ -39,7 +39,7 @@ from kla.ops.kernels.mps.kla_scan_bwd import scan_backward
 
 
 def _grid(B: int, M: int, S: int):
-    """``(threads, group_size)`` — one threadgroup per ``(batch, channel)``."""
+    """``(threads, group_size)``, one threadgroup per ``(batch, channel)``."""
     block_s, rows = tile_geometry(S)
     return (block_s, rows * M, B), (block_s, rows, 1)
 
@@ -61,7 +61,7 @@ def merged_chunk_forward(
     """Merged chunk forward. Returns ``(y, y_var, lam_fin, eta_fin, lam_ck, eta_ck)``.
 
     With ``checkpoints=False`` the two checkpoint tensors are one-element
-    placeholders — the kernel takes the flag and never writes them.
+    placeholders, the kernel takes the flag and never writes them.
     """
     check_inputs(msi, si, k, q, a, p, lam0, eta0)
     B, L, M = msi.shape

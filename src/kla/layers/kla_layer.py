@@ -307,8 +307,8 @@ class KLALayer(nn.Module):
     ):
         """x: [B, L, d_model].
 
-        Returns ``out`` — or ``(out, new_state)`` when ``return_state`` or a
-        ``state`` is passed — where ``out`` is ``y`` or ``(y, y_var)`` when
+        Returns ``out``, or ``(out, new_state)`` when ``return_state`` or a
+        ``state`` is passed, where ``out`` is ``y`` or ``(y, y_var)`` when
         ``config.return_variance``.
         """
         cfg = self.config

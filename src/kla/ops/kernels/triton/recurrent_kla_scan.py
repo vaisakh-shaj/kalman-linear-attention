@@ -1,19 +1,19 @@
-"""``triton_recurrent`` — the whole scan in one kernel, time serial.
+"""``triton_fused_recurrent``, the whole scan in one kernel, time serial.
 
 One program owns one ``(batch, channel)`` pair and walks the sequence a
 timestep at a time, holding all ``BLOCK_S`` states as a vector. The Möbius map
 is *applied* to a running λ rather than composed with its neighbours, so there
-is no 2×2 matrix, no trace normalization and no overflow path — about a quarter
-of ``triton_chunk``'s arithmetic, traded against the instruction-level
+is no 2×2 matrix, no trace normalization and no overflow path, about a quarter
+of ``triton_fused_chunk``'s arithmetic, traded against the instruction-level
 parallelism a ``[BLOCK_L, S]`` tile gives it.
 
 The lane count is the same either way (``B*M*S``); what differs is how many
 timesteps are in flight. So this is the one to reach for when there are already
-sequences and channels to spend — decode, and training at any real batch size —
-and ``triton_chunk`` when there are not.
+sequences and channels to spend, decode, and training at any real batch size,
+and ``triton_fused_chunk`` when there are not.
 
 The backward is :mod:`kla.ops.kernels.triton.kla_scan_bwd`, shared with
-``triton_chunk``. This forward writes the same ``[B, M, NCK, S]`` checkpoints at
+``triton_fused_chunk``. This forward writes the same ``[B, M, NCK, S]`` checkpoints at
 the same stride, which is all that backward needs; it is chunk-shaped itself,
 and does not care that the forward was not.
 """
@@ -24,7 +24,9 @@ import torch
 import triton
 import triton.language as tl
 
-_EPS = 1e-12
+from kla.ops.kernels.triton._tuning import RECURRENT_BLOCK_L, warps_for
+
+_EPS = tl.constexpr(1e-12)
 
 
 @triton.jit
@@ -117,8 +119,8 @@ def recurrent_forward(
     eta0,
     checkpoints: bool = False,
     prior: bool = False,
-    block_l: int = 64,
-    num_warps: int = 4,
+    block_l: int = RECURRENT_BLOCK_L,
+    num_warps: "int | None" = None,
 ):
     """Recurrent forward. Same returns as the chunk one, including the permuted
     ``[B,M,L]`` inputs and the ``[B,M,NCK,S]`` checkpoints the backward wants."""
@@ -140,6 +142,8 @@ def recurrent_forward(
     eta_fin = torch.empty(B, M, S, device=msi.device, dtype=torch.float32)
 
     n_chunks = triton.cdiv(L, block_l)
+    block_s = triton.next_power_of_2(S)
+    warps = warps_for(1, block_s) if num_warps is None else num_warps
     n_ck = n_chunks if checkpoints else 1
     ck_shape = (B, M, n_ck, S) if checkpoints else (1,)
     lam_ck = torch.empty(*ck_shape, device=msi.device, dtype=torch.float32)
@@ -167,8 +171,8 @@ def recurrent_forward(
         STORE_CK=bool(checkpoints),
         PRIOR=bool(prior),
         CK_STRIDE=block_l,
-        BLOCK_S=triton.next_power_of_2(S),
-        num_warps=num_warps,
+        BLOCK_S=block_s,
+        num_warps=warps,
     )
     return (
         y.permute(0, 2, 1).contiguous(),
@@ -262,6 +266,8 @@ class _RecurrentKLAScan(torch.autograd.Function):
         )
 
 
-def recurrent_kla_scan(msi, si, h, w, a, q, lam0, eta0, prior=False, block_l: int = 64):
+def recurrent_kla_scan(
+    msi, si, h, w, a, q, lam0, eta0, prior=False, block_l: int = RECURRENT_BLOCK_L
+):
     """Differentiable recurrent KLA scan → ``(y, y_var, lam_fin, eta_fin)``."""
     return _RecurrentKLAScan.apply(msi, si, h, w, a, q, lam0, eta0, prior, block_l)

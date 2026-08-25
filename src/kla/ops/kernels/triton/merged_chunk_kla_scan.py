@@ -1,28 +1,42 @@
-"""``triton_fused_chunk``, the whole scan in one kernel, time tiled.
+"""``triton_merged_chunk``, ``triton_fused_chunk``'s two scans, in one.
 
-One triton program owns one ``(batch, channel)`` pair and streams the sequence
-in ``BLOCK_L`` chunks, doing *everything* in registers with no intermediate
-``[B,L,M,S]`` tensor in HBM, round-tripping one of those through HBM is what
-costs an unfused implementation 30-50x at a realistic shape:
+Same shape as :mod:`kla.ops.kernels.triton.chunk_kla_scan`: one program owns
+one ``(batch, channel)`` pair and streams the sequence in ``BLOCK_L`` tiles,
+doing everything in registers with no ``[B,L,M,S]`` tensor in HBM. Same grid,
+same carry, same checkpoints, same backward. What changes is that the leaf
+scanned along the tile is the 3x3 map of :func:`_mrg_combine`, which carries η
+alongside λ, so there is one ``tl.associative_scan`` where that file runs two.
 
-    load k,q,v·Λ^v,Λ^v  →  φ,r  →  leaves  →  trace-norm Möbius scan → λ
-    →  λ_{t-1} by inverting the leaf  →  α  →  affine scan → η
-    →  readout  y=Σ_s q·η/λ,  yvar=Σ_s q²/λ
+    load k,q,v·Λ^v,Λ^v  →  φ,r  →  3x3 leaves  →  one trace-normed scan
+    →  apply to the carry → λ, η  →  readout  y=Σ_s q·η/λ,  yvar=Σ_s q²/λ
 
-Kernel-internal names differ from the paper's notation; the mapping is
-``msi``→v·Λ^v, ``si``→Λ^v, ``h``→k (key), ``w``→q (query), and the kernel's
-``q``/``q_ptr`` argument is the *process noise* p, not the query.
+Three things follow, and they are the reason this file exists:
 
-Key trick: λ_{t-1} = (D·λ_t − B)/(A − C·λ_t) recovers the previous precision
-locally (``A − C·λ = 1/(a²·den) > 0`` so it is stable, and it returns λ0 exactly
-at t=0), so the α-gain needs no cross-chunk λ shift.
+- **One scan instead of two.** ``tl.associative_scan`` over ``BLOCK_L`` is
+  ``log2(BLOCK_L)`` rounds of shuffles and predication; halved.
+- **The λ-inversion trick goes away.** ``chunk_kla_scan`` recovers
+  ``λ_{t-1} = (λ_t − φ)/(A − C·λ_t)`` by inverting the leaf, specifically so the
+  α-gain needs no cross-chunk λ shift. The merged scan never forms α at all,
+  its readout has λ and η directly.
+- **The carry is two scalars, not five.** ``chunk_kla_scan`` carries the 2x2
+  Möbius map accumulated from ``t=0`` plus ``η``; here the tile prefix is
+  applied to ``(λ, η)`` at the tile boundary and only that pair crosses it, as
+  in the Metal cell this is transcribed from.
 
-``a``/``p`` are static ``[M, S]`` (the paper's time-invariant dynamics), loaded
-once per program outside the sequence loop.
+Kernel-internal names follow the other triton files: ``msi``→v·Λ^v, ``si``→Λ^v,
+``h``→k (key), ``w``→q (query), and the ``q_ptr`` argument is the *process
+noise* p, not the query.
 
-The backward is :mod:`kla.ops.kernels.triton.kla_scan_bwd`, shared with the
-other two fused cells: this forward writes the same ``[B, M, NCK, S]``
-checkpoints at the same stride, which is all that backward needs.
+The backward is :mod:`kla.ops.kernels.triton.kla_scan_bwd`, unchanged and
+unaware, exactly as for the two-scan cells: this forward writes the same
+``[B, M, NCK, S]`` checkpoints at the same stride with the same convention (the
+value *entering* step t), and that backward replays a scalar recurrence from
+them. It never sees a composed map of any size, which is why merging the
+forward cannot touch it.
+
+Transcribed from ``kernels/mps/merged_chunk_kla_scan.metal`` and the algebra in
+``kernels/mps/kla_merged.metal``; ``kla.ops.kla_ops._merged_combine`` is the
+float64 reference both are checked against.
 """
 
 from __future__ import annotations
@@ -37,22 +51,30 @@ _EPS = tl.constexpr(1e-12)
 
 
 @triton.jit
-def _tn_combine(la, lb, lc, ld, ra, rb, rc, rd):
+def _mrg_combine(la, lb, lc, ld, lqa, lqb, ls, ra, rb, rc, rd, rqa, rqb, rs):
+    """The map "R after L", trace-normalized.
+
+    Lower block-triangular with a scalar (3,3), so this is never a full 3x3
+    product: ``P = P₂·P₁`` is the same 2x2 the other cells compose,
+    ``q = q₂·P₁ + s₂·q₁`` is a 1x2 row through it, and ``s = s₂·s₁`` is one
+    multiply. Dividing all seven by the 2x2 block's trace is free, λ = u/v and
+    η = w/v are both invariant under a common rescale of (u,v,w), and it is
+    load-bearing: ``s`` accumulates a⁻ⁿ, which overflows fp32 outright for a
+    decaying filter. See ``tests/test_merged_algebra.py``.
+    """
     a = ra * la + rb * lc
     b = ra * lb + rb * ld
     c = rc * la + rd * lc
     d = rc * lb + rd * ld
-    inv = 1.0 / tl.maximum(a + d, 1e-12)
-    return a * inv, b * inv, c * inv, d * inv
+    qa = rqa * la + rqb * lc + rs * lqa
+    qb = rqa * lb + rqb * ld + rs * lqb
+    s = rs * ls
+    inv = 1.0 / tl.maximum(a + d, _EPS)
+    return a * inv, b * inv, c * inv, d * inv, qa * inv, qb * inv, s * inv
 
 
 @triton.jit
-def _aff_combine(la, lb, ra, rb):
-    return ra * la, ra * lb + rb
-
-
-@triton.jit
-def _fused_fwd_kernel(
+def _merged_chunk_fwd_kernel(
     msi_ptr,  # v·Λ^v [B,M,L]
     si_ptr,  # Λ^v [B,M,L]
     h_ptr,  # k, the key [B,L,S]
@@ -84,27 +106,18 @@ def _fused_fwd_kernel(
     s_mask = s < S
     t = tl.arange(0, BLOCK_L)
 
-    lam0 = tl.load(lam0_ptr + (b * M + m) * S + s, mask=s_mask, other=1.0)  # [S]
-    c_eta = tl.load(
-        eta0_ptr + (b * M + m) * S + s, mask=s_mask, other=0.0
-    )  # η boundary
+    # The carry is (λ, η) themselves, not a map accumulated from t=0.
+    c_lam = tl.load(lam0_ptr + (b * M + m) * S + s, mask=s_mask, other=1.0)
+    c_eta = tl.load(eta0_ptr + (b * M + m) * S + s, mask=s_mask, other=0.0)
 
     # Static dynamics are loop-invariant, so hoist them out of the chunk loop.
     a_st = tl.load(a_ptr + m * S + s, mask=s_mask, other=1.0)
     q_st = tl.load(q_ptr + m * S + s, mask=s_mask, other=0.0)
-    # Floored, as every other cell floors it. Unfloored, the leaf A = (1+pφ)/a²
-    # reaches ~1e20 at a = 1e-10, and the scan composes two raw leaves before the
-    # first trace normalization -- A² ~ 1e40 overflows fp32, and the normalizer
-    # then computes inf/inf = NaN. Pinned by
-    # tests/test_backends.py::test_near_zero_decay_stays_finite.
     a2_st = tl.maximum(a_st * a_st, _EPS)
+    inv_a2_st = 1.0 / a2_st
+    inv_a_st = 1.0 / (a_st + tl.where(a_st < 0.0, -_EPS, _EPS))
 
-    cA = tl.zeros([BLOCK_S], tl.float32) + 1.0
-    cB = tl.zeros([BLOCK_S], tl.float32)
-    cC = tl.zeros([BLOCK_S], tl.float32)
-    cD = tl.zeros([BLOCK_S], tl.float32) + 1.0
-
-    base_ml = (b * M + m) * L  # μσ⁻¹[b,m,:], output[b,m,:]
+    base_ml = (b * M + m) * L  # msi/si[b,m,:], output[b,m,:]
     base_hw = b * L * S  # h[b,:,:], w[b,:,:]
     base_ck = (b * M + m) * N_CHUNKS
 
@@ -113,11 +126,12 @@ def _fused_fwd_kernel(
         t_mask = tt < L
 
         # The state *entering* this chunk is what kla_scan_bwd resumes from, so
-        # the store precedes the scan. It is free: the carry already exists.
+        # the store precedes the scan. Both checkpoints are written here; in the
+        # two-scan cell η did not exist yet at this point.
         if STORE_CK:
-            lam_in = (cA * lam0 + cB) / tl.maximum(cC * lam0 + cD, 1e-12)
-            tl.store(lam_ck_ptr + (base_ck + c) * S + s, lam_in, mask=s_mask)
+            tl.store(lam_ck_ptr + (base_ck + c) * S + s, c_lam, mask=s_mask)
             tl.store(eta_ck_ptr + (base_ck + c) * S + s, c_eta, mask=s_mask)
+
         hoff = base_hw + tt[:, None] * S + s[None, :]
         hw_mask = t_mask[:, None] & s_mask[None, :]
 
@@ -126,38 +140,45 @@ def _fused_fwd_kernel(
         h = tl.load(h_ptr + hoff, mask=hw_mask, other=0.0)
         wv = tl.load(w_ptr + hoff, mask=hw_mask, other=0.0)
 
-        phi = tl.maximum(si * h * h, 1e-12)
+        phi = tl.maximum(si * h * h, _EPS)
         rr = msi * h
 
-        # Broadcast a/q to the full [BLOCK_L, S] tile (static a/q load as [1, S]).
+        # Broadcast a/p to the full [BLOCK_L, S] tile (they load as [1, S]).
         zero = tl.zeros([BLOCK_L, BLOCK_S], tl.float32)
         a_t = a_st[None, :] + zero
         q_t = q_st[None, :] + zero
         a2_t = a2_st[None, :] + zero
+        inv_a2_t = inv_a2_st[None, :] + zero
 
-        A = (1.0 + q_t * phi) / a2_t
-        C = q_t / a2_t
+        # The 3x3 leaf, built from (φ, r, a, p) alone, nothing in it reads λ,
+        # which is the entire point.
+        C = q_t * inv_a2_t
+        A = (1.0 + q_t * phi) * inv_a2_t
         D = zero + 1.0
+        Qa = rr * C
+        Qb = rr  # r·D with D = 1
+        Sg = inv_a_st[None, :] + zero
 
-        sA, sB, sC, sD = tl.associative_scan(
-            (A, phi, C, D), axis=0, combine_fn=_tn_combine
+        # Rows past the end of the sequence must compose as the identity, or a
+        # partial final chunk would not reduce to what its live prefix does.
+        A = tl.where(t_mask[:, None], A, 1.0)
+        B = tl.where(t_mask[:, None], phi, 0.0)
+        C = tl.where(t_mask[:, None], C, 0.0)
+        Qa = tl.where(t_mask[:, None], Qa, 0.0)
+        Qb = tl.where(t_mask[:, None], Qb, 0.0)
+        Sg = tl.where(t_mask[:, None], Sg, 1.0)
+
+        sA, sB, sC, sD, sQa, sQb, sS = tl.associative_scan(
+            (A, B, C, D, Qa, Qb, Sg), axis=0, combine_fn=_mrg_combine
         )
-        fA = sA * cA[None, :] + sB * cC[None, :]
-        fB = sA * cB[None, :] + sB * cD[None, :]
-        fC = sC * cA[None, :] + sD * cC[None, :]
-        fD = sC * cB[None, :] + sD * cD[None, :]
-        inv = 1.0 / tl.maximum(fA + fD, 1e-12)
-        fA, fB, fC, fD = fA * inv, fB * inv, fC * inv, fD * inv
 
-        lam = (fA * lam0[None, :] + fB) / tl.maximum(fC * lam0[None, :] + fD, 1e-12)
-        # λ_{t-1} by inverting the leaf (A − C·λ = 1/(a²·den) > 0).
-        lam_prev = (lam - phi) / tl.maximum(A - C * lam, 1e-12)
-        alpha = a_t / tl.maximum(a2_t + q_t * lam_prev, 1e-12)
+        # Apply the inclusive prefix to the homogeneous vector (λ, 1, η). Both
+        # quotients share the denominator the 2x2 read-out already forms.
+        den = tl.maximum(sC * c_lam[None, :] + sD, _EPS)
+        lam = (sA * c_lam[None, :] + sB) / den
+        eta = (sQa * c_lam[None, :] + sQb + sS * c_eta[None, :]) / den
 
-        ga, gb = tl.associative_scan((alpha, rr), axis=0, combine_fn=_aff_combine)
-        eta = ga * c_eta[None, :] + gb
-
-        var = 1.0 / tl.maximum(lam, 1e-12)
+        var = 1.0 / tl.maximum(lam, _EPS)
         mean = eta * var
         if PRIOR:
             # decode_from_prior: read out one predict step ahead.
@@ -168,21 +189,17 @@ def _fused_fwd_kernel(
         tl.store(y_ptr + base_ml + tt, y, mask=t_mask)
         tl.store(yvar_ptr + base_ml + tt, yvar, mask=t_mask)
 
+        # One carry for both recurrences, taken from the last live row.
         last = tl.minimum(BLOCK_L, L - c * BLOCK_L) - 1
         sel = (t == last)[:, None]
-        cA = tl.sum(tl.where(sel, fA, 0.0), axis=0)
-        cB = tl.sum(tl.where(sel, fB, 0.0), axis=0)
-        cC = tl.sum(tl.where(sel, fC, 0.0), axis=0)
-        cD = tl.sum(tl.where(sel, fD, 0.0), axis=0)
+        c_lam = tl.sum(tl.where(sel, lam, 0.0), axis=0)
         c_eta = tl.sum(tl.where(sel, eta, 0.0), axis=0)
 
-    # Final filter state: λ_{L-1} from the accumulated Möbius matrix, η_{L-1}.
-    lam_fin = (cA * lam0 + cB) / tl.maximum(cC * lam0 + cD, 1e-12)
-    tl.store(lam_fin_ptr + (b * M + m) * S + s, lam_fin, mask=s_mask)
+    tl.store(lam_fin_ptr + (b * M + m) * S + s, c_lam, mask=s_mask)
     tl.store(eta_fin_ptr + (b * M + m) * S + s, c_eta, mask=s_mask)
 
 
-def chunk_forward(
+def merged_chunk_forward(
     msi,
     si,
     h,
@@ -196,14 +213,7 @@ def chunk_forward(
     block_l: int = CHUNK_BLOCK_L,
     num_warps: "int | None" = None,
 ):
-    """Fused forward. msi/si [B,L,M], h/w [B,L,S], lam0/eta0 [B,M,S].
-
-    ``a``/``q`` (decay and process noise) are static ``[M, S]``. Returns
-    ``(y, yvar)`` ``[B,L,M]``, the final ``(lam, eta)``, the permuted
-    ``[B,M,L]`` inputs the backward wants, and the ``[B,M,NCK,S]`` checkpoints.
-    With ``checkpoints=False`` the last two are one-element placeholders, the
-    kernel takes the flag and never writes them.
-    """
+    """Merged fused forward. Same signature and returns as ``chunk_forward``."""
     B, L, M = msi.shape
     S = h.shape[2]
 
@@ -228,7 +238,7 @@ def chunk_forward(
     ck_shape = (B, M, n_ck, S) if checkpoints else (1,)
     lam_ck = torch.empty(*ck_shape, device=msi.device, dtype=torch.float32)
     eta_ck = torch.empty(*ck_shape, device=msi.device, dtype=torch.float32)
-    _fused_fwd_kernel[(B * M,)](
+    _merged_chunk_fwd_kernel[(B * M,)](
         msi_t,
         si_t,
         h_c,
@@ -269,8 +279,8 @@ def chunk_forward(
     )
 
 
-class _FusedKLAScan(torch.autograd.Function):
-    """The fused triton forward, with the shared triton backward behind it."""
+class _MergedChunkKLAScan(torch.autograd.Function):
+    """The merged triton forward, with the shared triton backward behind it."""
 
     @staticmethod
     def forward(ctx, msi, si, h, w, a, q, lam0, eta0, prior, block_l):
@@ -288,7 +298,7 @@ class _FusedKLAScan(torch.autograd.Function):
             eta0_c,
             lam_ck,
             eta_ck,
-        ) = chunk_forward(
+        ) = merged_chunk_forward(
             msi,
             si,
             h,
@@ -345,8 +355,8 @@ class _FusedKLAScan(torch.autograd.Function):
         )
 
 
-def chunk_kla_scan(
+def merged_chunk_kla_scan(
     msi, si, h, w, a, q, lam0, eta0, prior=False, block_l: int = CHUNK_BLOCK_L
 ):
-    """Differentiable fused KLA scan → ``(y, y_var, lam_fin, eta_fin)``."""
-    return _FusedKLAScan.apply(msi, si, h, w, a, q, lam0, eta0, prior, block_l)
+    """Differentiable merged fused KLA scan → ``(y, y_var, lam_fin, eta_fin)``."""
+    return _MergedChunkKLAScan.apply(msi, si, h, w, a, q, lam0, eta0, prior, block_l)

@@ -2,17 +2,13 @@
  * The exact CUDA KLA scans -- launchers and the python entry points.
  *   kla_scan.cu
  *
- * cuda_recurrent, cuda_chunk, cuda_pscan, and the one backward all three share.
- * Every kernel is specialized on BLOCK_S = next_pow2(d_state) so the read-out
- * reduction unrolls to a fixed shape and the backward's replay buffers stay
- * fixed-size registers; ROWS follows from aiming a block at KLA_TG_THREADS.
- * What ROWS *means* differs per implementation -- channels stacked for recurrent,
- * timesteps split for chunk, chunks stacked for pscan -- so each entry point
- * declares its own grid.
- *
- * These replace the v2_* kernels rather than extending them: same algebra,
- * different adjoint. See kla_scan_bwd.cuh for why the new one is both exact and
- * cheaper. v2_1 and v2_2 stay in the tree as the comparison.
+ * cuda_fused_recurrent, cuda_fused_chunk, cuda_merged_chunk, and the one backward all three
+ * share. Every kernel is specialized on BLOCK_S = next_pow2(d_state) so the
+ * read-out reduction unrolls to a fixed shape and the backward's replay buffers
+ * stay fixed-size registers; ROWS follows from aiming a block at
+ * KLA_TG_THREADS. What ROWS *means* differs per implementation -- channels
+ * stacked for recurrent, timesteps split for the two chunk cells -- so each
+ * entry point declares its own grid.
  ******************************************************************************/
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
@@ -23,7 +19,7 @@
 #include <vector>
 
 #include "kla_chunk_fwd.cuh"
-#include "kla_pscan_fwd.cuh"
+#include "kla_merged_chunk_fwd.cuh"
 #include "kla_recurrent_fwd.cuh"
 #include "kla_scan_bwd.cuh"
 
@@ -154,11 +150,11 @@ std::vector<torch::Tensor> chunk_fwd(torch::Tensor msi, torch::Tensor si,
     return {y, yvar, lam_fin, eta_fin, lam_ck, eta_ck};
 }
 
-std::vector<torch::Tensor> pscan_fwd(torch::Tensor msi, torch::Tensor si,
-                                     torch::Tensor k, torch::Tensor q,
-                                     torch::Tensor a, torch::Tensor p,
-                                     torch::Tensor lam0, torch::Tensor eta0,
-                                     bool prior) {
+std::vector<torch::Tensor> merged_chunk_fwd(torch::Tensor msi, torch::Tensor si,
+                                            torch::Tensor k, torch::Tensor q,
+                                            torch::Tensor a, torch::Tensor p,
+                                            torch::Tensor lam0, torch::Tensor eta0,
+                                            bool checkpoints, bool prior) {
     check(msi, "msi"); check(si, "si"); check(k, "k"); check(q, "q");
     check(a, "a"); check(p, "p"); check(lam0, "lam0"); check(eta0, "eta0");
 
@@ -173,57 +169,25 @@ std::vector<torch::Tensor> pscan_fwd(torch::Tensor msi, torch::Tensor si,
     auto lam_fin = torch::empty({B, M, S}, opts);
     auto eta_fin = torch::empty({B, M, S}, opts);
 
-    // No `checkpoints` flag, unlike the other two forwards: the checkpoints are
-    // this implementation's own intermediates, so there is nothing to skip.
-    const int NCK = (L + KLA_CHUNK - 1) / KLA_CHUNK;
-    auto lam_ck = torch::empty({B, M, NCK, S}, opts);
-    auto eta_ck = torch::empty({B, M, NCK, S}, opts);
+    const int NCK = checkpoints ? (L + KLA_CHUNK - 1) / KLA_CHUNK : 1;
+    auto ck_shape = checkpoints ? std::vector<int64_t>{B, M, NCK, S}
+                                : std::vector<int64_t>{1};
+    auto lam_ck = torch::empty(ck_shape, opts);
+    auto eta_ck = torch::empty(ck_shape, opts);
 
-    // The scan aggregates: a 2x2 Moebius map and an affine pair per chunk, each
-    // double-buffered for the ping-pong. torch allocations are 512-byte
-    // aligned, so the float4 view is aligned too.
-    auto mob_t = torch::empty({B, M, NCK, S, 4}, opts);
-    auto mob_alt_t = torch::empty({B, M, NCK, S, 4}, opts);
-    auto aff_t = torch::empty({B, M, NCK, S, 2}, opts);
-    auto aff_alt_t = torch::empty({B, M, NCK, S, 2}, opts);
-    auto *mob = reinterpret_cast<float4 *>(mob_t.data_ptr<float>());
-    auto *mob_alt = reinterpret_cast<float4 *>(mob_alt_t.data_ptr<float>());
-    auto *aff = reinterpret_cast<float2 *>(aff_t.data_ptr<float>());
-    auto *aff_alt = reinterpret_cast<float2 *>(aff_alt_t.data_ptr<float>());
-
-    const int total = B * M * NCK * S;
-    const int flat = (total + KLA_TG_THREADS - 1) / KLA_TG_THREADS;
     auto stream = at::cuda::getCurrentCUDAStream();
-
-    kla_pscan_mob_reduce_kernel<<<flat, KLA_TG_THREADS, 0, stream>>>(
-        mob, si.data_ptr<float>(), k.data_ptr<float>(), a.data_ptr<float>(),
-        p.data_ptr<float>(), L, M, S, NCK, total);
-    for (int off = 1; off < NCK; off <<= 1) {
-        kla_pscan_mob_step_kernel<<<flat, KLA_TG_THREADS, 0, stream>>>(
-            mob_alt, mob, S, NCK, off, total);
-        std::swap(mob, mob_alt);
-    }
-
-    kla_pscan_aff_reduce_kernel<<<flat, KLA_TG_THREADS, 0, stream>>>(
-        aff, lam_ck.data_ptr<float>(), mob, msi.data_ptr<float>(),
-        si.data_ptr<float>(), k.data_ptr<float>(), a.data_ptr<float>(),
-        p.data_ptr<float>(), lam0.data_ptr<float>(), L, M, S, NCK, total);
-    for (int off = 1; off < NCK; off <<= 1) {
-        kla_pscan_aff_step_kernel<<<flat, KLA_TG_THREADS, 0, stream>>>(
-            aff_alt, aff, S, NCK, off, total);
-        std::swap(aff, aff_alt);
-    }
-
-    // Here ROWS spans *chunks*, not channels and not timesteps.
+    // Identical grid to chunk_fwd -- one block per (batch, channel), ROWS over
+    // time. Only what a thread composes differs.
 #define LAUNCH_BODY(BS, RW)                                                  \
-    kla_pscan_apply_kernel<BS, RW>                                           \
-        <<<dim3((NCK + (RW) - 1) / (RW), M, B), dim3(BS, RW), 0, stream>>>(  \
+    kla_merged_chunk_fwd_kernel<BS, RW, KLA_ITEMS>                           \
+        <<<dim3(M, B), dim3(BS, RW), 0, stream>>>(                           \
             y.data_ptr<float>(), yvar.data_ptr<float>(),                     \
             lam_fin.data_ptr<float>(), eta_fin.data_ptr<float>(),            \
-            eta_ck.data_ptr<float>(), lam_ck.data_ptr<float>(), aff,         \
+            lam_ck.data_ptr<float>(), eta_ck.data_ptr<float>(),              \
             msi.data_ptr<float>(), si.data_ptr<float>(), k.data_ptr<float>(),\
             q.data_ptr<float>(), a.data_ptr<float>(), p.data_ptr<float>(),   \
-            eta0.data_ptr<float>(), L, M, S, NCK, int(prior))
+            lam0.data_ptr<float>(), eta0.data_ptr<float>(), L, M, S, NCK,    \
+            int(checkpoints), int(prior))
     KLA_DISPATCH_BLOCK_S(S)
 #undef LAUNCH_BODY
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -281,7 +245,7 @@ std::vector<torch::Tensor> scan_bwd(torch::Tensor dy, torch::Tensor dyvar,
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("recurrent_fwd", &recurrent_fwd, "KLA recurrent forward (CUDA)");
     m.def("chunk_fwd", &chunk_fwd, "KLA chunk forward, time-parallel (CUDA)");
-    m.def("pscan_fwd", &pscan_fwd,
-          "KLA parallel-scan forward, no serial carry (CUDA)");
+    m.def("merged_chunk_fwd", &merged_chunk_fwd,
+          "KLA chunk forward, one 3x3 scan instead of two (CUDA)");
     m.def("bwd", &scan_bwd, "KLA exact backward, shared by every implementation (CUDA)");
 }

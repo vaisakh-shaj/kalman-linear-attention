@@ -1,11 +1,11 @@
-"""The triton backward — one adjoint for every fused triton implementation.
+"""The triton backward, one adjoint for every fused triton implementation.
 
 An adjoint does not have to mirror its forward. All this kernel needs is
-``(lambda, eta)`` at the chunk boundaries; how the forward got there — walking
-time serially, tiling it, or scanning it — changes nothing here. So
-``triton_recurrent``, ``triton_chunk`` and ``triton_pscan`` write the same
-``[B, M, NCK, S]`` checkpoints and share this one backward, exactly as the Metal
-kernels share ``kla_scan_bwd.metal``.
+``(lambda, eta)`` at the chunk boundaries; how the forward got there, walking
+time serially, tiling it, or folding both recurrences into one map, changes
+nothing here. So ``triton_fused_recurrent``, ``triton_fused_chunk`` and
+``triton_merged_chunk`` write the same ``[B, M, NCK, S]`` checkpoints and share
+this one backward, exactly as the Metal kernels share ``kla_scan_bwd.metal``.
 
 It is the *exact* adjoint, and cheaper than the composed one the CUDA kernels
 carry. Differentiating a trace-normalized prefix product means a 4-component
@@ -23,8 +23,8 @@ needs a tile shifted by one timestep (triton has no cheap shift along the scan
 axis, and both of the obvious workarounds divide by a gain that is small exactly
 when the filter is forgetting):
 
-1. ``alpha_t . eta_{t-1} = eta_t - r_t`` — removes eta_{t-1}.
-2. ``alpha_{t+1} . nu^eta_{t+1} = nu^eta_t - deta_t`` — removes the shifted
+1. ``alpha_t . eta_{t-1} = eta_t - r_t``, removes eta_{t-1}.
+2. ``alpha_{t+1} . nu^eta_{t+1} = nu^eta_t - deta_t``, removes the shifted
    adjoint from the lambda recurrence's source term.
 
 The multipliers themselves need no shift either: ``den_{t+1} = a^2 + p.lambda_t``
@@ -41,7 +41,9 @@ import torch
 import triton
 import triton.language as tl
 
-_EPS = 1e-12
+from kla.ops.kernels.triton._tuning import CHUNK_BLOCK_L, warps_for
+
+_EPS = tl.constexpr(1e-12)
 
 
 @triton.jit
@@ -65,7 +67,7 @@ def _aff_combine(la, lb, ra, rb):
 def _reverse_affine(mult_next, src, carry, t, BLOCK_L: tl.constexpr):
     """``nu_t = src_t + mult_next_t . nu_{t+1}``, with ``nu_L = carry``.
 
-    ``mult_next_t`` is the multiplier relating ``nu_t`` to ``nu_{t+1}`` — the
+    ``mult_next_t`` is the multiplier relating ``nu_t`` to ``nu_{t+1}``, the
     caller supplies it already in that alignment, which is why nothing is
     shifted here. Returns the tile and the value at ``t = 0``, which is the
     carry the *earlier* chunk resumes from.
@@ -309,8 +311,8 @@ def scan_backward(
     lam_ck,
     eta_ck,
     prior: bool = False,
-    block_l: int = 64,
-    num_warps: int = 4,
+    block_l: int = CHUNK_BLOCK_L,
+    num_warps: "int | None" = None,
 ):
     """The shared triton backward.
 
@@ -323,6 +325,8 @@ def scan_backward(
     B, M, L = msi_t.shape
     S = h.shape[2]
     n_chunks = lam_ck.shape[2]
+    block_s = triton.next_power_of_2(S)
+    warps = warps_for(block_l, block_s) if num_warps is None else num_warps
     dev = msi_t.device
     f32 = torch.float32
 
@@ -367,7 +371,7 @@ def scan_backward(
         n_chunks,
         PRIOR=bool(prior),
         BLOCK_L=block_l,
-        BLOCK_S=triton.next_power_of_2(S),
-        num_warps=num_warps,
+        BLOCK_S=block_s,
+        num_warps=warps,
     )
     return dmsi, dsi, dh, dw, da, dp, dlam0, deta0

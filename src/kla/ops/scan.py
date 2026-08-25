@@ -1,18 +1,22 @@
 """Generic associative-scan utilities for the pure-torch backend.
 
-Three interchangeable implementations of an inclusive scan over tuples of
-tensors (see ``docs/implementations.md`` for the implementations they name):
+Three interchangeable strategies for an inclusive scan over tuples of tensors.
+These are *internal* to :func:`kla.ops.kla_scan_torch`; they are not the
+implementation axis of ``docs/implementations.md``, which is a property of the
+kernels. What that axis calls ``chunk`` is ``chunk_scan`` here; what it calls
+``recurrent`` bypasses this module entirely (see below).
 
 - ``associative``: ``torch._higher_order_ops.associative_scan`` (PyTorch 2.8+).
-  A pscan — the whole sequence at once, no serial carry.
-- ``doubling``: vectorized Hillis–Steele doubling. Also a pscan. O(L log L) work
-  but only elementwise ops and ~log2(L) kernel launches; works everywhere, fully
-  autograd-compatible.
+  The whole sequence at once, no serial carry.
+- ``doubling``: vectorized Hillis-Steele doubling. O(L log L) work but only
+  elementwise ops and ~log2(L) kernel launches; works everywhere, fully
+  autograd-compatible, and the one ``gradcheck`` runs against.
 - ``chunk``: doubling inside a chunk, a serial carry across chunks. O(L) work
-  and O(L/C) serial steps, so it is the middle ground between the two above and
-  ``sequential``.
+  and O(L/C) serial steps, so it is the middle ground, and it is what the
+  ``torch_*_chunk`` cells use.
+
 There is no ``sequential`` entry here, and that is the point: a serial walk does
-not need an associative combine at all — it can *apply* the update to a running
+not need an associative combine at all; it can *apply* the update to a running
 value instead of composing two of them. That is
 :func:`kla.ops.kla_ops._recurrent_lambda_eta`, built on
 ``torch._higher_order_ops.scan``, and it lives next to the recurrence it applies
@@ -37,7 +41,7 @@ CombineFn = Callable[
 def doubling_scan(
     combine_fn: CombineFn, xs: Sequence[torch.Tensor], dim: int
 ) -> tuple[torch.Tensor, ...]:
-    """Inclusive scan via Hillis–Steele doubling."""
+    """Inclusive scan via Hillis-Steele doubling."""
     ys = tuple(xs)
     length = ys[0].size(dim)
     offset = 1
@@ -68,7 +72,7 @@ def chunk_scan(
 
     The torch counterpart of the GPU ``chunk`` kernels. Each chunk is scanned
     with :func:`doubling_scan`, then the previous chunk's last element is
-    composed into every element of this one — which is the serial carry, paid
+    composed into every element of this one, which is the serial carry, paid
     once per chunk rather than once per timestep.
     """
     length = xs[0].size(dim)

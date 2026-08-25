@@ -39,9 +39,9 @@ each). Both forwards write at this stride, so either can hand its checkpoints to
 :func:`~kla.ops.kernels.mps.kla_scan_bwd.scan_backward`."""
 
 DEFAULT_ITEMS = 8
-"""Timesteps each thread of ``mps_chunk``'s forward walks serially. Trades the tile
-scan's overhead (paid once per ``ITEMS`` steps) against parallelism, since the
-tile covers ``ROWS * ITEMS`` timesteps at once."""
+"""Timesteps each thread of ``mps_fused_chunk``'s forward walks serially. Trades
+the tile scan's overhead (paid once per ``ITEMS`` steps) against parallelism,
+since the tile covers ``ROWS * ITEMS`` timesteps at once."""
 
 _TG_THREADS = 256  # threadgroup size to aim for
 
@@ -68,7 +68,7 @@ def require_mps(what: str = "The MPS KLA backend") -> None:
 
 
 def launch_geometry(d_state: int) -> tuple[int, int]:
-    """``(BLOCK_S, ROWS)`` for a given state width — see the module docstring."""
+    """``(BLOCK_S, ROWS)`` for a given state width, see the module docstring."""
     block_s = _next_pow2(d_state)
     rows = max(1, _TG_THREADS // block_s) if block_s <= 32 else 1
     return block_s, rows
@@ -92,10 +92,10 @@ def _library(stems: tuple, block_s: int, rows: int, chunk: int, items: int = 0):
 
 
 def tile_geometry(d_state: int) -> tuple[int, int]:
-    """``(BLOCK_S, ROWS)`` for ``mps_chunk``, where ROWS spans *time*.
+    """``(BLOCK_S, ROWS)`` for ``mps_fused_chunk``, where ROWS spans *time*.
 
-    Unlike :func:`launch_geometry` the second axis is never pinned to 1 — it is
-    the whole point of that kernel — so the read-out reduction takes its
+    Unlike :func:`launch_geometry` the second axis is never pinned to 1, it is
+    the whole point of that kernel, so the read-out reduction takes its
     threadgroup-memory path once past a SIMD-group's width.
     """
     block_s = _next_pow2(d_state)
@@ -103,14 +103,14 @@ def tile_geometry(d_state: int) -> tuple[int, int]:
 
 
 def chunk_library(d_state: int, items: int = DEFAULT_ITEMS, chunk: int = DEFAULT_CHUNK):
-    """``mps_chunk``'s forward, specialized on the state width and tile shape.
+    """``mps_fused_chunk``'s forward, specialized on the state width and tile shape.
 
     ``items`` is this kernel's own tile depth; ``chunk`` is the *backward's*
     checkpoint stride, which it only writes at. The two are independent, and
     conflating them under one name is a bug waiting to happen -- hence the
     separate ``KLA_ITEMS`` and ``KLA_CHUNK`` defines.
     """
-    _require_dstate(d_state, "mps_chunk")
+    _require_dstate(d_state, "mps_fused_chunk")
     block_s, rows = tile_geometry(d_state)
     return _library(("chunk_kla_scan",), block_s, rows, chunk, items)
 
@@ -131,34 +131,15 @@ def merged_chunk_library(
     )
 
 
-def merged_pscan_library(d_state: int, chunk: int = DEFAULT_CHUNK):
-    """``mps_merged_pscan``'s three kernels. Same geometry as :func:`pscan_library`."""
-    _require_dstate(d_state, "mps_merged_pscan")
-    block_s, rows = tile_geometry(d_state)
-    return _library(("kla_merged", "merged_pscan_kla_scan"), block_s, rows, chunk)
-
-
 def recurrent_library(d_state: int, chunk: int = DEFAULT_CHUNK):
-    """``mps_recurrent``'s forward, specialized on the state width."""
-    _require_dstate(d_state, "mps_recurrent")
+    """``mps_fused_recurrent``'s forward, specialized on the state width."""
+    _require_dstate(d_state, "mps_fused_recurrent")
     block_s, rows = launch_geometry(d_state)
     return _library(("recurrent_kla_scan",), block_s, rows, chunk)
 
 
-def pscan_library(d_state: int, chunk: int = DEFAULT_CHUNK):
-    """``mps_pscan``'s five kernels, specialized on the state width.
-
-    ``chunk`` is both the reduce-then-scan's chunk length and the checkpoint
-    stride here — the same number, because the states entering each chunk *are*
-    the checkpoints this implementation already computes.
-    """
-    _require_dstate(d_state, "mps_pscan")
-    block_s, rows = tile_geometry(d_state)
-    return _library(("pscan_kla_scan",), block_s, rows, chunk)
-
-
 def bwd_library(d_state: int, chunk: int = DEFAULT_CHUNK):
-    """The backward both implementations share. Lane-per-state, like the recurrent
+    """The backward all three cells share. Lane-per-state, like the recurrent
     forward, whatever geometry the forward that wrote the checkpoints used."""
     _require_dstate(d_state, "the MPS backward")
     block_s, rows = launch_geometry(d_state)

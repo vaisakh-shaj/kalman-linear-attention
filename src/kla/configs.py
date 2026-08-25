@@ -11,11 +11,12 @@ import dataclasses
 from typing import Literal, Optional, Union
 
 # Implementations are named "<backend>[_unfused|_merged]_<implementation>",
-# where the implementation is how the kernel gets through the sequence:
-# recurrent, chunk or pscan, and the middle token says how much is fused --
-# "merged" being one scan for both recurrences rather than two. A bare backend
-# name is that backend's default. "auto" is the only value whose meaning depends
-# on the machine. See docs/implementations.md.
+# where the implementation is how the kernel gets through the sequence --
+# recurrent or chunk -- and the middle token says how much is fused, "merged"
+# being one scan for both recurrences rather than two. Every backend carries
+# the same three cells; a bare backend name is that backend's default, and
+# "auto" is the only value whose meaning depends on the machine.
+# See docs/implementations.md.
 Backend = Literal[
     "auto",
     # bare backend names -- that backend's default implementation
@@ -23,33 +24,22 @@ Backend = Literal[
     "triton",
     "cuda",
     "mps",
-    # torch
+    # torch -- unfused throughout; the only backend that runs float64
     "torch_unfused_recurrent",
     "torch_unfused_chunk",
-    "torch_unfused_pscan",
-    # torch, merged -- one scan for both recurrences
     "torch_merged_chunk",
-    "torch_merged_pscan",
     # triton
-    "triton_recurrent",
-    "triton_chunk",
-    "triton_pscan",
-    "triton_unfused_recurrent",
-    "triton_unfused_chunk",
-    "triton_unfused_pscan",
+    "triton_fused_recurrent",
+    "triton_fused_chunk",
+    "triton_merged_chunk",
     # cuda
-    "cuda_recurrent",
-    "cuda_chunk",
-    "cuda_pscan",
-    # prior kernels, the only ones with an approximate backward
-    "cuda_v2_2",
-    "cuda_v2_1",
+    "cuda_fused_recurrent",
+    "cuda_fused_chunk",
+    "cuda_merged_chunk",
     # mps
-    "mps_recurrent",
-    "mps_chunk",
-    "mps_pscan",
+    "mps_fused_recurrent",
+    "mps_fused_chunk",
     "mps_merged_chunk",
-    "mps_merged_pscan",
 ]
 MobiusImpl = Literal["linear", "log"]
 
@@ -207,8 +197,7 @@ class KLAConfig:
     """Implementation of the core scan.
 
     "auto" reads the device and nothing else: triton on CUDA, Metal on Apple
-    silicon, torch otherwise. It never selects a "cuda_v2_*" kernel, whose
-    backward is an approximate adjoint.
+    silicon, torch otherwise.
 
     Every other value pins a code path. "torch", "triton", "cuda" and "mps" are
     their backend's default; a full

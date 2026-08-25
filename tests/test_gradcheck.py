@@ -1,7 +1,7 @@
 """Finite-difference gradient checks (float64) for the KLA scan.
 
-These validate the *math* — the Möbius precision recurrence, the affine
-information recurrence, and the read-out — against central differences, which is
+These validate the *math*, the Möbius precision recurrence, the affine
+information recurrence, and the read-out, against central differences, which is
 the one check that does not assume any hand-written adjoint is correct.
 
 Why this only covers the torch backend
