@@ -1,5 +1,7 @@
 # KLA - Kalman Linear Attention
 
+**[Project page](https://kalman-linear-attention.github.io/)** · **[Paper (ICML 2026)](https://arxiv.org/abs/2602.10743)** · **[Poster](https://kalman-linear-attention.github.io/static/kla_poster_icml2026.pdf)**
+
 A linear attention layer that is an **exact parallel Kalman filter**.
 Unlike other linear attention layers which model the current state as a single point in the state space,
 KLA models the current state as a **belief** over the state space, and updates it in closed form as the sequence arrives.
