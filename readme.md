@@ -35,6 +35,9 @@ git clone https://github.com/vaisakh-shaj/kalman-linear-attention.git kla
 uv pip install ./kla
 ```
 
+The CUDA backend compiles on first use and requires a compatible CUDA toolkit
+and C++ compiler. See [CUDA setup](docs/backends.md#cuda-setup).
+
 Runs on CPU, NVIDIA GPUs and Apple silicon out of the box. To see what this
 machine will use:
 
@@ -42,12 +45,7 @@ machine will use:
 python -m kla --check-backends
 ```
 
-For more details and other faster options see
-[docs/backends.md](docs/backends.md):
-
-```bash
-uv pip install "kla[triton]"
-```
+For backend selection and CUDA setup, see [the backend guide](docs/backends.md).
 
 ## Structure
 
@@ -60,6 +58,21 @@ The ancillary parts are:
 - `tests/`: Unit tests for the package.
 
 ### Package
+
+The default is the **Mamba-style block**, used for pretraining for parameter
+efficiency: values come directly from the conv stream, and observation variance
+uses a low-rank projection. Our MAD experiments use the **plain block**, with
+full value and variance projections. Both configurations use the same Kalman scan.
+
+```python
+from kla import KLAConfig
+
+KLAConfig()  # default: value_rank="conv", var_rank="auto"
+KLAConfig(value_rank="full", var_rank="full")  # plain block for MAD
+```
+
+For existing checkpoints, use the projection settings and ranks they were trained
+with; older default models used full projections.
 
 ```python
 import torch
@@ -80,11 +93,34 @@ model = SequenceModel(
 logits = model(torch.randint(0, 50304, (2, 256)))
 ```
 
+**For training on NVIDIA GPUs, install KLA using the instructions above and
+follow [CUDA setup](docs/backends.md#cuda-setup), then set `backend="cuda"`.**
+This selects the latest supported CUDA kernel included in your installed KLA
+release; you do not need to choose a kernel version. For easier setup, keep
+`backend="auto"`.
+
+```python
+layer = KLALayer(
+    d_model=512,
+    config=KLAConfig(d_state=16, backend="cuda"),
+).cuda()
+y = layer(torch.randn(2, 1024, 512, device="cuda"))
+```
+
+CUDA currently supports static dynamics with `d_state <= 64` and does not return
+the filter state. Use `auto` for stateful prefill and decoding, as above.
+
 Full API, config reference and the two published blocks: [docs/usage.md](docs/usage.md).
 
 ### Experiments
 
 *Coming Soon*
+
+## Updates
+
+- **2026-09-09:** Updated `backend="cuda"` to use v3 with faster backward computation
+  and corrected gradients, including chunk-boundary fixes. Improved initialization
+  of dynamics parameters and observation noise. Previous kernels remain selectable. See [backends](docs/backends.md).
 
 ## Citation
 

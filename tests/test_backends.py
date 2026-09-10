@@ -1,30 +1,7 @@
-"""Cross-backend parity: every available backend against the sequential reference.
+"""Backend parity against the sequential reference.
 
-The backends implement the same math with very different numerics, so each gets
-its own tolerance profile rather than one shared threshold:
-
-* ``torch``  — the reference implementation. Forward and backward both tight.
-* ``triton`` — hand-written kernels with an exact reverse-scan adjoint. Tight.
-* ``cuda``   — the fused CUDA kernel. Its forward is bit-exact, but its
-  trace-normalized Möbius **backward is not the exact adjoint** (see the parity
-  notes in :mod:`kla.ops.cuda_backend`): gradients that flow through the
-  precision scan are only accurate to ~5-15 % relative, while the ones that flow
-  through the information-vector / read-out path are exact.
-* ``mps_fused`` / ``mps_composed`` — the two Metal strategies
-  (:mod:`kla.ops.mps_backend`). Both tight, *including the fused one*: applying
-  the Möbius map per step instead of composing it makes the adjoint elementary,
-  so the fused MPS kernel has none of the CUDA kernel's gradient looseness even
-  though it is the same fully-fused strategy.
-
-The ``cuda`` point is why :data:`PROFILES` splits the gradient inputs into
-``exact_grads`` and ``loose_grads``. Asserting a tight threshold on the loose
-group would fail on a *correct* build — the looseness is a documented property
-of that backward, not a bug to be caught here. If you want exact gradients, use
-anything except the ``cuda`` kernels.
-
-Backends that cannot run here raise :class:`NotImplementedError` from the
-dispatcher and are skipped, so this file is meaningful on a CPU-only box, on a
-GPU node with or without a CUDA toolkit, and on a Mac.
+Every backend uses the same numerical criteria. Known legacy failures are
+tracked separately from correctness.
 """
 
 import dataclasses
@@ -36,8 +13,7 @@ import torch
 
 from kla.ops import KLAState, init_state, kla_scan, kla_scan_reference
 
-# Input order accepted by every backend, used to label gradient comparisons.
-INPUT_NAMES = ("v", "lambda_v", "k", "q", "a", "p")
+from kla.ops.accuracy import ATOL, RTOL, INPUT_NAMES, AccuracyMismatch, detail, metrics
 
 
 @dataclasses.dataclass(frozen=True)
@@ -45,14 +21,8 @@ class Profile:
     """Per-backend accuracy contract."""
 
     name: str
-    fwd_atol: float
-    fwd_rtol: float
-    exact_grads: tuple[str, ...]
-    """Inputs whose gradient the backend computes exactly (tight threshold)."""
-    loose_grads: tuple[str, ...] = ()
-    """Inputs with a documented approximate gradient (relaxed threshold)."""
-    exact_grad_tol: float = 2e-3
-    loose_grad_tol: float = 0.25
+    fwd_atol: float = ATOL
+    fwd_rtol: float = RTOL
     returns_state: bool = True
     supports_initial_state: bool = True
     clips_phi: bool = False
@@ -78,52 +48,36 @@ _LANE_FORM = (
 PROFILES = {
     p.name: p
     for p in [
-        Profile("torch", 2e-4, 1e-4, exact_grads=INPUT_NAMES),
-        Profile("triton", 5e-4, 5e-4, exact_grads=INPUT_NAMES, exact_grad_tol=1e-2),
-        # v2.1: exact forward; the precision-scan adjoint is approximate. dv and
-        # dq ride the information-vector / read-out path and stay exact, whereas
-        # d(lambda_v) additionally feeds the precision scan, so it is loose.
+        Profile("torch"),
+        Profile("triton"),
+        # Corrected CUDA builds check every input gradient.
+        *[
+            Profile(
+                name,
+                returns_state=False,
+                supports_initial_state=False,
+            )
+            for name in ("cuda", "cuda_v3", "cuda_v3_fast")
+        ],
         Profile(
-            "cuda",
-            1e-4,
-            1e-4,
-            exact_grads=("v", "q"),
-            loose_grads=("lambda_v", "k", "a", "p"),
+            "cuda_v2_2",
             returns_state=False,
             supports_initial_state=False,
         ),
-        # The harder-clamped variant. Same numerics as `cuda` on well-conditioned
-        # inputs -- it diverges only where its phi ceiling engages, which is what
-        # `clips_phi` pins down.
+        # Legacy variant with an additional phi ceiling.
         Profile(
             "cuda_v2_1",
-            1e-4,
-            1e-4,
-            exact_grads=("v", "q"),
-            loose_grads=("lambda_v", "k", "a", "p"),
             returns_state=False,
             supports_initial_state=False,
             clips_phi=True,
         ),
-        # Both Metal strategies get the exact-gradient contract. For the fused
-        # one that is the interesting claim: it is the same "one kernel, hand-
-        # written backward" shape as `cuda` above, yet every input is tight,
-        # because a per-step Moebius map has an elementary adjoint where a
-        # trace-normalized prefix product does not.
+        # Both Metal strategies check every input gradient.
         Profile(
             "mps_fused",
-            5e-4,
-            5e-4,
-            exact_grads=INPUT_NAMES,
-            exact_grad_tol=1e-2,
             scan_form=_LANE_FORM,
         ),
         Profile(
             "mps_composed",
-            5e-4,
-            5e-4,
-            exact_grads=INPUT_NAMES,
-            exact_grad_tol=1e-2,
             scan_form=_LANE_FORM,
         ),
     ]
@@ -186,26 +140,7 @@ def device_for(backend):
 
 
 def report(title, rows, why=None):
-    """Print a measurement table and the reading of it, then let the caller assert.
-
-    A pass/fail threshold tells you a backend is inside its documented budget; it
-    does not tell you *where* inside. For the CUDA kernels that distinction
-    matters -- their adjoint is approximate by construction, so the useful
-    question is whether today's deviation is 5 % or 24 % of a 25 % budget, and a
-    green test hides both. Printing also means a failing run shows every input's
-    number rather than stopping at the first one over budget.
-
-    ``why`` explains what the numbers mean for *this* backend, derived from the
-    measured values rather than canned. Several of these tests pass for opposite
-    reasons depending on the profile -- v2_1 passes the high-phi test by
-    *deviating* -- so a bare green dot is genuinely ambiguous.
-
-    Captured by default; run with ``-s`` (or ``-rA``) to see it:
-
-        pytest tests/test_backends.py -k cuda -s
-
-    ``rows`` is ``(label, value, annotation)``.
-    """
+    """Print measurements; run pytest with -s to see passing cases too."""
     width = max((len(r[0]) for r in rows), default=0)
     print(f"\n  {title}")
     for label, value, note in rows:
@@ -244,8 +179,9 @@ def test_forward_matches_reference(backend):
         """,
     )
 
-    torch.testing.assert_close(y, y_ref, atol=prof.fwd_atol, rtol=prof.fwd_rtol)
-    torch.testing.assert_close(y_var, y_var_ref, atol=prof.fwd_atol, rtol=prof.fwd_rtol)
+    for name, got, ref in (("y", y, y_ref), ("variance", y_var, y_var_ref)):
+        m = metrics(got, ref)
+        assert m["passed"], detail(name, m)
     assert (y_var >= 0).all(), "read-out variance must be non-negative"
 
 
@@ -291,84 +227,37 @@ def test_chunked_state_carry(backend):
 # -------------------------------------------------------------------- backward
 
 
-@pytest.mark.parametrize("backend", ALL_BACKENDS)
-def test_backward_matches_reference(backend):
-    """Per-input gradient parity, against each backend's documented contract."""
-    prof = PROFILES[backend]
+def _gradient_cases():
+    for backend in ALL_BACKENDS:
+        for name in INPUT_NAMES:
+            marks = []
+            # Fixed normal-input, combined-loss precision-path regression.
+            if backend in ("cuda_v2_1", "cuda_v2_2") and name in ("lambda_v", "k", "a", "p"):
+                marks = [pytest.mark.xfail(
+                    strict=True, raises=AccuracyMismatch,
+                    reason="Known legacy CUDA precision-path gradient defect",
+                )]
+            yield pytest.param(backend, name, marks=marks, id=f"{backend}-{name}")
+
+
+@pytest.mark.parametrize("backend,name", list(_gradient_cases()))
+def test_backward_matches_reference(backend, name):
+    """Each input must meet the same absolute-plus-relative error limit."""
     device = device_for(backend)
     inputs = make_inputs(device, requires_grad=True)
     refs = tuple(t.detach().clone().requires_grad_(True) for t in inputs)
-
-    y, y_var, _ = run_backend(backend, inputs)
-    y_ref, y_var_ref, _ = kla_scan_reference(*refs)
-
-    # Squaring y keeps the read-out path in the loss; summing y_var keeps the
-    # precision path in it. Both are needed to give every input a gradient.
-    (y.square().sum() + y_var.sum()).backward()
-    (y_ref.square().sum() + y_var_ref.sum()).backward()
-
-    # Measure every input first, print the table, and only then assert. Asserting
-    # inside the loop would stop at the first input over budget and hide the rest
-    # -- exactly the inputs you need to see when a kernel change moves the
-    # approximate adjoint.
-    rows, over = [], []
-    for name, got, ref in zip(INPUT_NAMES, inputs, refs):
-        assert got.grad is not None, f"{backend}: no gradient reached {name}"
-        assert torch.isfinite(got.grad).all(), f"{backend}: non-finite d{name}"
-        err = rel_err(got.grad, ref.grad)
-        loose = name in prof.loose_grads
-        budget = prof.loose_grad_tol if loose else prof.exact_grad_tol
-        rows.append(
-            (
-                f"d{name}",
-                err,
-                f"{'loose' if loose else 'exact'}  budget {budget:<7g} "
-                f"using {100 * err / budget:6.2f}%",
-            )
-        )
-        if err >= budget:
-            over.append(
-                f"d{name} {err:.3e} >= {budget:g} ({'loose' if loose else 'exact'})"
-            )
-
-    worst_name, worst_err, _ = max(
-        rows,
-        key=lambda r: (
-            r[1]
-            / (
-                prof.loose_grad_tol
-                if r[0][1:] in prof.loose_grads
-                else prof.exact_grad_tol
-            )
-        ),
-    )
-    worst_budget = (
-        prof.loose_grad_tol
-        if worst_name[1:] in prof.loose_grads
-        else prof.exact_grad_tol
-    )
-    report(
-        f"{backend}: gradient deviation vs the sequential reference",
-        rows,
-        why=f"""
-        Worst input is {worst_name} at {100 * worst_err / worst_budget:.2f}% of its
-        budget. {
-            "All six gradients are exact adjoints, so anything above ~1e-6 would "
-            "mean a real bug."
-            if not prof.loose_grads
-            else f"The loose group ({', '.join(prof.loose_grads)}) flows through the "
-            "trace-normalized Moebius backward, which is NOT the exact adjoint of the "
-            "forward compose -- a few percent there is the documented contract, not a "
-            f"regression. The exact group ({', '.join(prof.exact_grads)}) rides the "
-            "information-vector and read-out paths, which are exact, so those "
-            "must stay tight."
-        } PASS means every input is inside the budget its own path earns; it
-        does not mean the gradients are correct to float32 -- read the percentages.
-        """,
-    )
-    assert not over, (
-        f"{backend}: gradient(s) outside the documented budget: " + "; ".join(over)
-    )
+    y, var, _ = run_backend(backend, inputs)
+    yr, vr, _ = kla_scan_reference(*refs)
+    (y.square().sum() + var.sum()).backward()
+    (yr.square().sum() + vr.sum()).backward()
+    index = INPUT_NAMES.index(name)
+    got, ref = inputs[index].grad, refs[index].grad
+    assert got is not None and ref is not None, f"missing gradient: {name}"
+    m = metrics(got, ref)
+    assert m["finite"], detail(name, m)  # Nonfinite results never count as xfail.
+    print(detail(name, m))
+    if not m["passed"]:
+        raise AccuracyMismatch(detail(name, m))
 
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
@@ -423,7 +312,7 @@ def test_gradient_descent_reduces_loss(backend):
 def test_non_positive_process_noise_stays_finite(backend, bad_p):
     """A non-positive process noise must be floored, not propagated into a NaN.
 
-    ``p = 0`` is a real configuration (``KLAConfig.zero_process_noise``), and a
+    ``p = 0`` is a real configuration (``process_noise_mode="zero"``), and a
     negative p is reachable whenever ``p`` is optimized directly. Every backend
     floors it at ``P_MIN``; without that floor ``(a² + p·λ)`` crosses zero and the
     recursion diverges on the GPU paths while torch stays finite -- same input,
@@ -971,8 +860,6 @@ def test_mps_widens_low_precision_inputs(backend, dtype):
 
 COVERED_ELSEWHERE = {
     # Aliases of a profiled entry: same kernels, so parity is already asserted.
-    "cuda": "alias of cuda_v2_2",
-    "cuda_v2_2": "same kernel as the profiled 'cuda'",
     "mps": "alias of the profiled mps_fused",
     # Forward-only, so it cannot take the shared backward test.
     "mps_tiled": "forward-only; covered by the tiled-kernel tests above",

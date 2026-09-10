@@ -18,7 +18,8 @@ y = layer(torch.randn(2, 1024, 512))  # [2, 1024, 512]
 ```
 
 `d_model` is a constructor argument; everything else lives on `KLAConfig`.
-Omitting the config gives you the published defaults.
+Omitting the config gives you the parameter-efficient Mamba-style block used for
+pretraining. Select full projections explicitly for the MAD architecture.
 
 ## The two knobs that matter
 
@@ -105,8 +106,8 @@ Two config presets, differing only in how the sensor path is shaped. Neither
 touches the scan — both emit the same tensors, so no backend or kernel changes.
 
 ```python
-KLAConfig(value_rank="full", var_rank="full")  # plain block (the default)
-KLAConfig(value_rank="conv", var_rank="dt")  # mamba block
+KLAConfig()  # mamba block (default): value_rank="conv", var_rank="auto"
+KLAConfig(value_rank="full", var_rank="full")  # plain block used for MAD
 ```
 
 `value_rank` controls how the value `v` is produced from the post-conv stream.
@@ -117,11 +118,17 @@ per-channel noise level, exactly what Mamba does to `Δ`.
 
 A rank only *saves* when `2*rank < d_inner`: the bottleneck costs two projections
 where the full map costs one. Solve for it against a parameter budget rather than
-picking one by eye. `"dt"` means `dt_rank`, defaulting to `ceil(d_model / 8)`.
+picking one by eye. `"auto"` uses a bottleneck of width `ceil(d_model / 8)`;
+pass an integer directly to choose another width for either projection.
+The defaults are `value_rank="conv"` and `var_rank="auto"`: no value projection
+and an automatic bottleneck for variance. `"auto"` replaces the old `"dt"`
+setting; the separate `dt_rank` override has been removed.
 
-Quality is comparable, so pick on parameter budget: at `d_model=512` the mamba
-block is 1.79M parameters against plain's 3.76M. The paper uses plain for the MAD
-synthetics and mamba for the FineWeb-Edu pretraining runs.
+The paper uses plain for MAD and Mamba-style for FineWeb-Edu pretraining for
+parameter efficiency. At `d_model=512`, the current Mamba-style configuration
+has about 1.79M parameters against plain's 3.76M. Both use the same Kalman scan.
+When loading an existing checkpoint, specify its original projection settings
+and bottleneck widths explicitly; changing defaults does not convert weights.
 
 ## Functional API
 
@@ -139,3 +146,28 @@ return `(y, y_var, final_state)`.
 `kla_scan` is the dispatcher — it takes `backend=`, plus `scan_impl` and
 `mobius_impl` for the torch path. `kla_step` is one recurrent step for decode.
 `kla_scan_reference` is the sequential loop every backend is validated against.
+
+### Noise initialization
+
+New layers learn continuous process noise as `exp(p_log)`, initialized to
+`3 * abs(a) * delta` using each cell's sampled delta. Noise and delta then learn
+independently. The observation-variance head starts at the constant `1/d_state`
+with zero output weights and a learnable bias; `obs_noise_init` sets a different
+baseline. The heuristic assumes normalized keys and is an initialization choice,
+not a training-stability guarantee.
+
+Use `process_noise_init=0.02` to initialize continuous noise to a constant.
+This replaces `process_noise_init="constant", process_noise_scale=0.02`.
+For legacy checkpoints, construct the layer with `process_noise_param="raw"`,
+`process_noise_init=0.01`, and `obs_noise_init=None` before loading. Also match
+the checkpoint's projection settings: old default models need
+`value_rank="full", var_rank="full"`.
+Raw noise and log noise have different state-dict keys; no automatic conversion
+is performed.
+
+`process_noise_mode` controls whether continuous noise is `"learned"` (default),
+`"fixed"` at its initialized value, or `"zero"` regardless of initialization.
+Fixed and zero modes use non-trainable buffers; the scan retains its numerical
+noise floor. This replaces `learnable_process_noise` and `zero_process_noise`.
+For example, `KLAConfig(process_noise_mode="fixed", process_noise_init=0.02)`
+keeps continuous noise at 0.02 while the dynamics and delta can still learn.

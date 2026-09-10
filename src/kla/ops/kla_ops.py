@@ -387,8 +387,22 @@ def _backend_triton_composed(*args, **kwargs):
     return kla_scan_triton(*args, kernel="composed", **kwargs)
 
 
+def _backend_cuda_v3(*args, **kwargs):
+    """Corrected scalar backward; see :mod:`kla.ops.cuda_backend`."""
+    from kla.ops.cuda_backend import kla_scan_cuda
+
+    return kla_scan_cuda(*args, kernel_version="v3", **kwargs)
+
+
+def _backend_cuda_v3_fast(*args, **kwargs):
+    """Corrected scalar backward; see :mod:`kla.ops.cuda_backend`."""
+    from kla.ops.cuda_backend import kla_scan_cuda
+
+    return kla_scan_cuda(*args, kernel_version="v3_fast", **kwargs)
+
+
 def _backend_cuda_v2_2(*args, **kwargs):
-    """The corrected kernel, named — see :mod:`kla.ops.cuda_backend`."""
+    """Legacy matrix backward — see :mod:`kla.ops.cuda_backend`."""
     from kla.ops.cuda_backend import kla_scan_cuda
 
     return kla_scan_cuda(*args, kernel_version="v2_2", **kwargs)
@@ -432,7 +446,9 @@ _BACKENDS = {
     "triton": _backend_triton,
     "triton_fused": _backend_triton_fused,
     "triton_composed": _backend_triton_composed,
-    "cuda": _backend_cuda_v2_2,  # the corrected kernel
+    "cuda": _backend_cuda_v3_fast,
+    "cuda_v3": _backend_cuda_v3,
+    "cuda_v3_fast": _backend_cuda_v3_fast,
     "cuda_v2_2": _backend_cuda_v2_2,
     "cuda_v2_1": _backend_cuda_v2_1,
     "mps": _backend_mps_fused,
@@ -461,8 +477,8 @@ def _mps_available() -> bool:
 
 
 # Device -> the backend "auto" picks there, if its kernels are importable. The
-# `cuda` kernels are deliberately absent: their backward is an approximate
-# adjoint, so they stay opt-in.
+# CUDA JIT kernels stay opt-in: they require a compiler and support only
+# static dynamics with no returned filter state.
 _AUTO = (
     ("is_cuda", "triton", _triton_available),
     ("is_mps", "mps", _mps_available),

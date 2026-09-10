@@ -2,8 +2,8 @@
 
 Two named presets over ``value_rank`` / ``var_rank``::
 
-    plain block   value_rank="full", var_rank="full"   <- the defaults, the paper
-    mamba block   value_rank="conv", var_rank="dt"
+    plain block   value_rank="full", var_rank="full"   <- MAD
+    mamba block   value_rank="conv", var_rank="auto"   <- default, pretraining
 
 The load-bearing property is that **neither is visible to the scan**. Both emit
 v [B,L,M], Lambda^v [B,L,M], k/q [B,L,S], so no backend, kernel or backward
@@ -21,7 +21,7 @@ from kla.ops.kla_ops import _sufficient_stats
 
 D, S, B, L = 64, 8, 2, 12
 PLAIN = dict(value_rank="full", var_rank="full")
-MAMBA = dict(value_rank="conv", var_rank="dt")
+MAMBA = dict(value_rank="conv", var_rank="auto")
 
 
 def _cfg(**kw):
@@ -40,7 +40,7 @@ def _params(layer):
     [
         PLAIN,
         MAMBA,
-        dict(value_rank="dt", var_rank="dt"),
+        dict(value_rank="auto", var_rank="auto"),
         dict(value_rank=16, var_rank=4),
     ],
 )
@@ -57,7 +57,7 @@ def test_scan_sees_identical_shapes():
     it, the failure should surface here rather than as a confusing kernel error.
     """
     ref = None
-    for preset in (PLAIN, MAMBA, dict(value_rank="dt", var_rank="dt")):
+    for preset in (PLAIN, MAMBA, dict(value_rank="auto", var_rank="auto")):
         lay = KLALayer(D, _cfg(**preset))
         z = torch.randn(B, L, lay.d_inner)
         sig = [(t.shape, t.dtype) for t in lay._project_sensors(z)]
@@ -77,9 +77,8 @@ def test_conv_value_is_exactly_z():
 # ------------------------------------------------------------- parameters
 
 
-def test_plain_is_the_published_default():
-    """The defaults must still build the paper's layer, or every stored result moves."""
-    assert KLAConfig().value_rank == "full" and KLAConfig().var_rank == "full"
+def test_plain_block_remains_available():
+    """Explicit full projections retain the MAD architecture."""
     M = 2 * D
     plain = KLALayer(D, _cfg(**PLAIN))
     # sensor_proj emits v(M) + logvar(M) + k(S) + q(S), and nothing expands.
@@ -87,25 +86,32 @@ def test_plain_is_the_published_default():
     assert plain.value_expand is None and plain.var_expand is None
 
 
-def test_mamba_block_is_cheaper_and_wired_right():
+def test_mamba_is_the_default_and_wired_right():
+    assert KLAConfig().value_rank == "conv" and KLAConfig().var_rank == "auto"
     M, r = 2 * D, math.ceil(D / 8)
-    m = KLALayer(D, _cfg(**MAMBA))
+    m = KLALayer(D, _cfg())
     assert m.sensor_proj.out_features == r + 2 * S  # no value slice at all
     assert m.value_expand is None  # v = z, nothing to lift
     assert (m.var_expand.in_features, m.var_expand.out_features) == (r, M)
     assert _params(m) < _params(KLALayer(D, _cfg(**PLAIN)))
 
 
-def test_explicit_rank_is_honoured():
-    m = KLALayer(D, _cfg(value_rank=16, var_rank=4))
-    assert m.sensor_proj.out_features == 16 + 4 + 2 * S
-    assert m.value_expand.in_features == 16 and m.var_expand.in_features == 4
+@pytest.mark.parametrize("value_rank,var_rank", [(16, 4), ("auto", 4), (16, "auto")])
+def test_explicit_rank_is_honoured(value_rank, var_rank):
+    m = KLALayer(D, _cfg(value_rank=value_rank, var_rank=var_rank))
+    vr = math.ceil(D / 8) if value_rank == "auto" else value_rank
+    rr = math.ceil(D / 8) if var_rank == "auto" else var_rank
+    assert m.sensor_proj.out_features == vr + rr + 2 * S
+    assert m.value_expand.in_features == vr and m.var_expand.in_features == rr
 
 
-def test_dt_follows_dt_rank_override():
-    """'dt' resolves through cfg.dt_rank, so one knob governs every bottleneck."""
-    m = KLALayer(D, _cfg(value_rank="dt", var_rank="dt", dt_rank=5))
-    assert m.value_expand.in_features == 5 and m.var_expand.in_features == 5
+@pytest.mark.parametrize("d_model", [7, 64, 65])
+def test_auto_rank_follows_model_width(d_model):
+    """Automatic bottleneck width is ceil(d_model / 8)."""
+    m = KLALayer(d_model, _cfg(value_rank="auto", var_rank="auto"))
+    rank = math.ceil(d_model / 8)
+    assert m.value_expand.in_features == rank
+    assert m.var_expand.in_features == rank
 
 
 # --------------------------------------------------------------- gradients

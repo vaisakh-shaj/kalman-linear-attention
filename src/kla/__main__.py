@@ -56,20 +56,8 @@ def _families(names: tuple[str, ...]) -> dict[str, list[str]]:
     return grouped
 
 
-# Accuracy contract, condensed from the parity profiles in tests/test_backends.py
-# (the tests are not importable from the installed package, so the numbers are
-# restated here; keep them in step).
-_ATOL = _RTOL = 5e-4
-_GRAD_TOL = 1e-2
-# The CUDA backward is a knowingly approximate adjoint on the precision-scan
-# path, so d(lambda_v), d(k), d(a) and d(p) are held to a documented looser
-# budget - see the parity notes in kla.ops.cuda_backend. Tightening these would
-# fail a *correct* build.
-# Keyed by the group prefix, so every cuda kernel version gets the same budget.
-_LOOSE_GRADS = {"cuda": ("lambda_v", "k", "a", "p")}
-_LOOSE_GRAD_TOL = 0.25
-
-_INPUT_NAMES = ("v", "lambda_v", "k", "q", "a", "p")
+from kla.ops.accuracy import INPUT_NAMES as _INPUT_NAMES
+from kla.ops.accuracy import LEGACY, detail, metrics
 
 
 def _nvcc() -> str | None:
@@ -208,19 +196,16 @@ def _forward(backend: str, device: str) -> tuple[str, str]:
     except NotImplementedError as exc:
         return "skipped", _oneline(exc)
     except Exception as exc:
-        return "FAILED", _oneline(exc)
+        return "FAIL", _oneline(exc)
 
     if not (torch.isfinite(y).all() and torch.isfinite(y_var).all()):
-        return "FAILED", "produced non-finite output"
+        return "FAIL", "produced non-finite output"
 
     y_ref, y_var_ref, _ = kla_scan_reference(*args)
-    dy = (y - y_ref).abs().max().item()
-    dvar = (y_var - y_var_ref).abs().max().item()
-    detail = f"max|dy| {dy:.1e}   max|dvar| {dvar:.1e}   (atol {_ATOL:g})"
-    matches = torch.allclose(y, y_ref, atol=_ATOL, rtol=_RTOL) and torch.allclose(
-        y_var, y_var_ref, atol=_ATOL, rtol=_RTOL
-    )
-    return ("ok" if matches else "FAILED"), detail
+    rows = [(name, metrics(got, ref)) for name, got, ref in
+            (("y", y, y_ref), ("variance", y_var, y_var_ref))]
+    return ("PASS" if all(m["passed"] for _, m in rows) else "FAIL",
+            "; ".join(detail(name, m) for name, m in rows))
 
 
 def _gradients(backend: str, device: str) -> tuple[str, str]:
@@ -239,28 +224,30 @@ def _gradients(backend: str, device: str) -> tuple[str, str]:
     except NotImplementedError as exc:
         return "skipped", _oneline(exc)
     except Exception as exc:
-        return "FAILED", _oneline(exc)
+        return "FAIL", _oneline(exc)
 
     y_ref, y_var_ref, _ = kla_scan_reference(*refs)
     (y_ref.square().sum() + y_var_ref.sum()).backward()
 
-    loose = next((v for k, v in _LOOSE_GRADS.items() if backend.startswith(k)), ())
-    worst_name, worst_ratio, worst_err = "", 0.0, 0.0
+    rows = []
+    failed = False
+    known = False
     for name, got, ref in zip(_INPUT_NAMES, args, refs):
-        if got.grad is None:
-            return "FAILED", f"no gradient reached d{name}"
-        if not torch.isfinite(got.grad).all():
-            return "FAILED", f"non-finite d{name}"
-        err = _rel_err(got.grad, ref.grad)
-        budget = _LOOSE_GRAD_TOL if name in loose else _GRAD_TOL
-        if err / budget > worst_ratio:
-            worst_name, worst_ratio, worst_err = name, err / budget, err
-
-    budget = _LOOSE_GRAD_TOL if worst_name in loose else _GRAD_TOL
-    detail = f"worst d{worst_name} {worst_err:.1e}   (budget {budget:g})"
-    if loose:
-        detail += f"   [d{', d'.join(loose)} approximate by design]"
-    return ("ok" if worst_ratio < 1.0 else "FAILED"), detail
+        if got.grad is None or ref.grad is None:
+            return "FAIL", f"missing gradient: {name}"
+        m = metrics(got.grad, ref.grad)
+        status = "PASS"
+        if not m["passed"]:
+            # Known precision-path defects only; NaNs are always failures.
+            if m["finite"] and backend in LEGACY and name in ("lambda_v", "k", "a", "p"):
+                status = "KNOWN FAIL"
+                known = True
+            else:
+                status = "FAIL"
+                failed = True
+        rows.append(f"{status} {detail(name, m)}")
+    return ("FAIL" if failed else "KNOWN FAIL" if known else "PASS",
+            "\n".join(rows))
 
 
 _CHECKS = (("forward", _forward), ("gradients", _gradients))
@@ -275,13 +262,20 @@ def _test(backend: str, device: str, indent: str) -> bool:
     ok, last = True, None
     for label, run in _CHECKS:
         status, detail = run(backend, device)
-        ok &= status == "ok"
+        ok &= status == "PASS"
         # A skip reason is the dispatcher's, so it repeats across every check.
         if (status, detail) == last:
             detail = "(same reason)"
         else:
             last = (status, detail)
-        print(f"{indent}{label:<9}  {status:<7}  {detail}")
+        import os
+        import sys
+
+        shown = status
+        if sys.stdout.isatty() and "NO_COLOR" not in os.environ:
+            color = {"PASS": "32", "KNOWN FAIL": "33", "FAIL": "31"}.get(status, "0")
+            shown = f"\033[{color}m{status}\033[0m"
+        print(f"{indent}{label:<9}  {shown}  {detail}")
     return ok
 
 

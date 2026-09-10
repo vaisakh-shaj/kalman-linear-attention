@@ -1,89 +1,16 @@
-"""CUDA backend for the KLA scan (torch cpp_extension JIT).
+"""JIT-compiled CUDA scan with chunk checkpoints and scalar reverse scans.
 
-A fused CUDA kernel for the KLA core scan — a linear-space, *trace-normalized*
-2×2 Möbius scan plus an affine information scan, both via CUB block scans
-(register-resident, chunked with cross-chunk prefix carries). Sources are
-JIT-compiled on first use via :func:`torch.utils.cpp_extension.load`, so the
-published wheel ships no prebuilt binaries.
+``cuda`` / ``cuda_v3_fast`` use v3 with fast math; ``cuda_v3`` uses the
+same sources without fast math. Both implement the corrected backward.
+Legacy ``cuda_v2_2`` and ``cuda_v2_1`` retain their original gradient errors
+for reproducibility; v2_1 also caps observation information.
 
-Kernel versions
----------------
-Two kernels ship side by side, one directory each under ``kernels/cuda/``. The
-algebra and the scan structure are identical; they differ only in their numerical
-guards, and that difference is a genuine trade-off rather than a fix.
+Supports static dynamics [M,S], d_state <= 64, and float32 computation.
+Only zero/unit initial state is supported; the final state is not returned.
+``auto`` continues to select Triton on CUDA devices.
 
-``v2_2`` — ``backend="cuda"``, the default
-    The mathematically faithful one: it computes what torch and triton compute,
-    with no ad-hoc bounds. (1) No ceiling on the per-token information gain
-    ``phi = Λ^v·k²`` (the ``KLA_EPS`` floor stays). (2) The backward's
-    ``phi_mask`` carries no upper condition, so ``d(Λ^v)`` and the phi-path of
-    ``d(k)`` are never hard-zeroed. (3) ``a²`` is floored at ``KLA_EPS`` in both
-    fwd and bwd, so ``1/a²`` cannot reach ``inf``.
-
-    Because nothing caps ``phi``, bounding the inputs is the caller's job:
-    ``obs_var_min`` / ``obs_var_max`` bound ``Λ^v`` and ``qk_norm`` /
-    ``clip_value`` bound ``k``, and those apply on every backend identically.
-
-``v2_1`` — ``backend="cuda_v2_1"``
-    More heavily bounded against variance excursions, but not rigorous. It
-    clamps ``phi`` to ``[1e-12, 1000]`` in ``compute_phi_r``, which hard-limits
-    how much information a single token can inject and so keeps ``λ`` — and with
-    it ``var = 1/λ`` — from swinging as far. That extra stability is real, and on
-    badly-scaled inputs it can be the difference between a usable run and a
-    blown-up one.
-
-    It is not principled, though: ``r = (v·Λ^v)·k`` is left unclamped, and
-    ``Λ^v`` only cancels out of ``mean = r/phi = v/k`` because *both* carry it.
-    So a token saturating the cap by ``ρ = phi/1000`` emerges with its mean *and*
-    its variance scaled by ``ρ``. Under the layer defaults ``phi`` reaches
-    ``1/obs_var_min = 1e4``, so the cap sits *inside* the operating range rather
-    than safely above it. It also divides by an unfloored ``a²``.
-
-    Prefer ``v2_2`` and bound the inputs at the layer. Reach for ``v2_1`` when
-    you need the harder clamp, or to reproduce a run made under it: a checkpoint
-    *trained* on v2_1 has that clip baked into its learned ``σ²_v`` and will not
-    reproduce its variances under v2_2 (or under torch/triton, which never had
-    the clip). Pin the version to match the run.
-
-Supported subset (anything else raises :class:`NotImplementedError`, so the
-dispatcher's other backends stay usable):
-
-* static ``a``/``q`` of shape ``[M, S]`` (the time-invariant discretized dynamics)
-* ``d_state <= 64`` (``MAX_DSTATE``), float32 CUDA tensors
-* zero/unit initial state (no carried prefill state) and
-  ``decode_from_prior=False``
-
-All layer-level features (projections, conv, qk-norm, discretization to
-``a``/``q``, gating, λ-skip, variance read-out) are applied in PyTorch around
-this scan, so the kernel is a drop-in for :func:`kla.ops.kla_scan_torch` on the
-subset above. The kernel does not return the final filter state, so this path is
-for training / full-sequence forward only (``backend="cuda"`` is never chosen by
-``"auto"``).
-
-Parity status (validated against the sequential reference on sm_86):
-
-* **forward is bit-exact** (max abs error ~5e-7 in y and the variance);
-* **backward is approximate on the precision-scan gradients** — d(sigma_inv),
-  d(h), d(a), d(q) differ by ~5–15 % relative, while d(mu_sigma_inv) and d(w)
-  (the information-vector / read-out path) are exact. This is a property of the
-  kernel's trace-normalized Möbius backward, which is not the exact adjoint.
-  Treat this backend as an exact *forward / inference* path and a training
-  *speed* baseline; for exact gradients use ``backend="torch"`` or ``"triton"``.
-
-Build toolchain
----------------
-The kernel must be compiled with a CUDA toolkit matching the installed torch
-(CUDA 13 for the ``cu130`` wheels; nix's nvcc 12.9 is the wrong major version).
-That toolchain is *not* a project dependency — the ``nvidia-cuda-nvcc-cu13`` /
-``nvidia-cuda-cccl-cu13`` pip packages have no py3.14 wheels and don't belong in
-the runtime lockfile. Provision it out-of-band (a py≤3.13 sidecar venv, or an
-existing toolkit) and point ``CUDA_HOME`` (or ``KLA_CUDA_HOME``) at a tree with
-``bin/nvcc`` + the cub/cccl headers + ``lib64/libcudart.so`` (``ninja`` must
-also be importable — it drives the cpp_extension build). Set
-``KLA_JIT_VERBOSE=1`` to see the build command line. torch already ships the
-cu13 cudart + cusparse/cublas redist headers under ``site-packages/nvidia/cu13``
-— :func:`_extra_include_paths` adds them automatically, so a minimal nvcc+cccl
-toolkit (e.g. nix's ``cuda-toolkit`` 13.x) is enough.
+Sources compile on first use. Install a toolkit matching torch and set
+CUDA_HOME (or KLA_CUDA_HOME); KLA_JIT_VERBOSE=1 shows build diagnostics.
 """
 
 from __future__ import annotations
@@ -101,8 +28,8 @@ _KERNELS_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "kernels", "cuda"
 )
 
-KERNEL_VERSIONS = ("v2_2", "v2_1")
-DEFAULT_KERNEL_VERSION = "v2_2"
+KERNEL_VERSIONS = ("v3_fast", "v3", "v2_2", "v2_1")
+DEFAULT_KERNEL_VERSION = "v3_fast"
 
 
 def _csrc_dir(version: str) -> str:
@@ -112,11 +39,14 @@ def _csrc_dir(version: str) -> str:
             f"Unknown CUDA kernel version {version!r}; "
             f"expected one of {list(KERNEL_VERSIONS)}"
         )
-    return os.path.join(_KERNELS_DIR, version)
+    return os.path.join(_KERNELS_DIR, "v3" if version == "v3_fast" else version)
 
 
 _NVCC_FLAGS = [
     "-O3",
+    # torch >= 2.13's headers use C++20 default member initializers on
+    # bit-fields (c10/core/AutogradState.h); nvcc's frontend rejects those
+    # under -std=c++17 even where the host compiler would accept them.
     "-std=c++17",
     "--use_fast_math",
     # cu13 toolchains commonly mix nvcc and cccl/runtime header minor versions
@@ -130,6 +60,15 @@ _NVCC_FLAGS = [
     "--expt-relaxed-constexpr",
     "--expt-extended-lambda",
 ]
+
+def _nvcc_flags(version: str) -> list[str]:
+    """Keep separate fast and standard-math builds of the same v3 sources."""
+    _csrc_dir(version)
+    flags = list(_NVCC_FLAGS)
+    if version == "v3":
+        flags.remove("--use_fast_math")
+    return flags
+
 
 MAX_DSTATE = 64
 
@@ -186,11 +125,20 @@ def _load_extension(version: str = DEFAULT_KERNEL_VERSION):
     return load(
         name=f"kla_matmul_scan_cuda_{version}",
         sources=sources,
-        extra_cuda_cflags=_NVCC_FLAGS,
+        extra_cuda_cflags=_nvcc_flags(version),
         extra_cflags=["-O3", "-std=c++17"],
         extra_include_paths=_extra_include_paths(version),
         verbose=os.environ.get("KLA_JIT_VERBOSE", "0") == "1",
     )
+
+
+def _to_cuda_scan_layout(x: torch.Tensor) -> torch.Tensor:
+    """Convert [B,L,C] to [B,C,L] with unit time stride, including L=1."""
+    x = x.transpose(1, 2).contiguous()
+    # contiguous() may preserve a nonunit stride on singleton dimensions.
+    if x.stride(-1) != 1:
+        x = torch.empty(x.shape, dtype=x.dtype, device=x.device).copy_(x)
+    return x
 
 
 class _KLAMatmulScanFn(torch.autograd.Function):
@@ -204,10 +152,10 @@ class _KLAMatmulScanFn(torch.autograd.Function):
     def forward(ctx, mu_sigma_inv, sigma_inv, h, w, a, q, version):
         ext = _load_extension(version)
         ctx.version = version  # backward must compile against the same kernel
-        msi = mu_sigma_inv.transpose(1, 2).contiguous()  # [B, M, L]
-        si = sigma_inv.transpose(1, 2).contiguous()
-        h_t = h.transpose(1, 2).contiguous()  # [B, S, L]
-        w_t = w.transpose(1, 2).contiguous()
+        msi = _to_cuda_scan_layout(mu_sigma_inv)  # [B, M, L]
+        si = _to_cuda_scan_layout(sigma_inv)
+        h_t = _to_cuda_scan_layout(h)  # [B, S, L]
+        w_t = _to_cuda_scan_layout(w)
         a = a.contiguous()
         q = q.contiguous()
 
@@ -219,8 +167,8 @@ class _KLAMatmulScanFn(torch.autograd.Function):
     def backward(ctx, dy, dyvar):
         ext = _load_extension(ctx.version)
         msi, si, h_t, w_t, a, q, mob_b, lin_b, lam_b = ctx.saved_tensors
-        dy_t = dy.transpose(1, 2).contiguous()
-        dyvar_t = dyvar.transpose(1, 2).contiguous()
+        dy_t = _to_cuda_scan_layout(dy)
+        dyvar_t = _to_cuda_scan_layout(dyvar)
 
         dmsi, dsi, dh, dw, da, dq = ext.bwd(
             dy_t, dyvar_t, msi, si, h_t, w_t, a, q, mob_b, lin_b, lam_b
@@ -257,8 +205,7 @@ def kla_scan_cuda(
     except the final state is ``None`` (the kernel is forward/training only).
 
     ``kernel_version`` selects between the shipped kernels — see the module
-    docstring. Defaults to ``v2_2``; pass ``"v2_1"`` for its harder ``phi`` clamp
-    or to reproduce a run made under it.
+    docstring. Defaults to ``v3_fast``; legacy versions remain selectable.
     """
     if not v.is_cuda:
         raise _unsupported("requires CUDA tensors")

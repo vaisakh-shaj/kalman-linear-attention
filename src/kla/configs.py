@@ -20,6 +20,8 @@ Backend = Literal[
     "triton_fused",
     "triton_composed",
     "cuda",
+    "cuda_v3",
+    "cuda_v3_fast",
     "cuda_v2_2",
     "cuda_v2_1",
     "mps",
@@ -31,15 +33,12 @@ ScanImpl = Literal["auto", "associative", "doubling", "sequential"]
 MobiusImpl = Literal["linear", "log"]
 
 # How a d_inner-wide sensor signal is produced from the post-conv stream z.
-#   "full"  one Linear(M, M): no bottleneck. The published architecture.
-#   "dt"    low rank M -> r -> M, r = dt_rank or ceil(d_model/8). Named after
-#           Mamba's dt_proj, which occupies the same slot (Delta is the only
-#           d_inner-wide control signal Mamba has); the rank is twice Mamba's
-#           own ceil(d_model/16), since sigma^2_v carries more than a timescale.
+#   "full"  one Linear(M, M): no bottleneck. Used for the MAD experiments.
+#   "auto"  low rank M -> r -> M, with r = ceil(d_model/8).
 #   int     that rank explicitly. Only *saves* when 2*rank < d_inner.
 #   "conv"  (value only) v = z, no projection at all. Mamba's move.
-Rank = Union[int, Literal["full", "dt"]]
-ValueRank = Union[int, Literal["full", "dt", "conv"]]
+Rank = Union[int, Literal["full", "auto"]]
+ValueRank = Union[int, Literal["full", "auto", "conv"]]
 
 
 @dataclasses.dataclass
@@ -76,14 +75,19 @@ class KLAConfig:
     decay positive and is critical for stacking layers; "zoh" uses q_d = Δ·q_c."""
 
     # --- process / observation noise --------------------------------------
-    process_noise_scale: float = 0.01
-    """Initial scale of the continuous process noise; 0.01 works best empirically."""
+    process_noise_param: Literal["raw", "log"] = "log"
+    """Learn positive noise via exp(p_log); raw preserves legacy checkpoints."""
 
-    learnable_process_noise: bool = True
-    """If True the process noise is a trained parameter, otherwise a fixed buffer."""
+    process_noise_init: Union[float, Literal["heuristic"]] = "heuristic"
+    """Initial continuous noise: 3*abs(a)*delta, or a finite positive constant.
+    Initialization only; noise and delta subsequently learn independently."""
 
-    zero_process_noise: bool = False
-    """Ablation: force (near-)zero process noise, recovering deterministic dynamics."""
+    obs_noise_init: Optional[Union[float, Literal["auto"]]] = "auto"
+    """Constant initial observation variance; auto = 1/d_state, None = legacy."""
+
+    process_noise_mode: Literal["learned", "fixed", "zero"] = "learned"
+    """Learn noise, keep its initialized value fixed, or force (near-)zero noise.
+    Fixed and zero modes use buffers; zero bypasses process_noise_init."""
 
     obs_var_min: float = 1e-4
     """Floor added to the predicted observation variance (softplus(log_var) + floor)."""
@@ -92,23 +96,23 @@ class KLAConfig:
     """Optional clamp on the predicted observation variance."""
 
     # --- sensor path shape: the "plain" and "mamba" blocks -----------------
-    # Two knobs, both defaulting to the published architecture. The two named
-    # blocks are just presets over them:
+    # The default uses the parameter-efficient pretraining configuration.
+    # The two named blocks are presets over the same layer:
     #
-    #   plain block   value_rank="full", var_rank="full"   <- these defaults
-    #   mamba block   value_rank="conv", var_rank="dt"
+    #   plain block   value_rank="full", var_rank="full"   (MAD)
+    #   mamba block   value_rank="conv", var_rank="auto"   (default, pretraining)
     #
     # Neither touches the scan: both emit v [B,L,M], Lambda^v [B,L,M],
     # k/q [B,L,S], so kla_scan cannot tell them apart and no backend, kernel or
     # backward changes.
-    value_rank: ValueRank = "full"
+    value_rank: ValueRank = "conv"
     """How the value ``v`` is produced from the post-conv stream ``z``.
 
     ``v`` is d_inner wide, so this is the single most expensive projection in
     the layer: "full" costs M^2 per block. "conv" (v = z) is Mamba's move and
     costs nothing at all.
 
-    CAUTION on an integer / "dt" here: unlike the variance, ``v`` is the signal
+    CAUTION on an integer / "auto" here: unlike the variance, ``v`` is the signal
     being *filtered*, and a low-rank map confines it to a fixed r-dimensional
     subspace of the channel space for every token. The read-out is not hard
     capped at rank r (the ``eta * 1/lambda`` gain is elementwise and nonlinear,
@@ -116,7 +120,7 @@ class KLAConfig:
     filter can observe. Untested; "full" and "conv" are the two published
     choices."""
 
-    var_rank: Rank = "full"
+    var_rank: Rank = "auto"
     """How the observation noise ``log sigma^2_v`` is produced from ``z``.
 
     Low-ranking this is the safe one: it is a per-channel noise *level*, smooth
@@ -171,10 +175,6 @@ class KLAConfig:
     decode_from_prior: bool = False
     """Output the one-step-ahead prior prediction instead of the filtered posterior."""
 
-    dt_rank: Optional[int] = None
-    """Rank used by the ``"dt"`` setting of ``value_rank`` / ``var_rank``
-    (named after Mamba's dt_rank). None = ceil(d_model / 8)."""
-
     # --- numerics ----------------------------------------------------------
     clip_value: Optional[float] = None
     """Optional symmetric clamp on h/w projections (and max clamp on process noise)."""
@@ -184,8 +184,8 @@ class KLAConfig:
     """Kernel backend for the core scan.
 
     "auto" reads the device and nothing else: triton on CUDA, Metal on Apple
-    silicon, torch otherwise. It never selects a "cuda" kernel, whose backward
-    is an approximate adjoint.
+    silicon, torch otherwise. CUDA JIT kernels remain opt-in; "cuda" selects
+    v3 with fast math and corrected backward gradients.
 
     Every other value pins a code path. "torch", "triton", "cuda" and "mps" are
     the default implementation of their family; a "<family>_<impl>" name pins an

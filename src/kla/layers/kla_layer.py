@@ -73,9 +73,11 @@ class KLALayer(nn.Module):
         # all (v = z, Mamba's move). Only the WIDTHS of this one Linear change;
         # the four outputs keep their shapes, so nothing downstream of here
         # (scan, backward, any backend) is affected.
-        auto_rank = config.dt_rank or math.ceil(d_model / 8)
-        self._value_rank = auto_rank if config.value_rank == "dt" else config.value_rank
-        self._var_rank = auto_rank if config.var_rank == "dt" else config.var_rank
+        auto_rank = math.ceil(d_model / 8)
+        self._value_rank = (
+            auto_rank if config.value_rank == "auto" else config.value_rank
+        )
+        self._var_rank = auto_rank if config.var_rank == "auto" else config.var_rank
 
         # Width this projection emits for each of the two wide signals.
         self._w_value = (
@@ -108,10 +110,38 @@ class KLALayer(nn.Module):
         self.lambda_log = nn.Parameter(torch.empty(M, S))
         self.lambda_log._no_weight_decay = True
 
-        if config.learnable_process_noise and not config.zero_process_noise:
-            self.process_noise = nn.Parameter(torch.empty(M, S))
+        if config.process_noise_param not in ("raw", "log"):
+            raise ValueError("process_noise_param must be raw or log")
+        if config.process_noise_mode not in ("learned", "fixed", "zero"):
+            raise ValueError("process_noise_mode must be learned, fixed, or zero")
+        noise_init = config.process_noise_init
+        if noise_init != "heuristic" and (
+            isinstance(noise_init, bool)
+            or not isinstance(noise_init, (int, float))
+            or not math.isfinite(noise_init)
+            or noise_init <= 0
+        ):
+            raise ValueError(
+                "process_noise_init must be heuristic or a finite positive number"
+            )
+        self._p_log_param = config.process_noise_param == "log"
+        p_name = "p_log" if self._p_log_param else "process_noise"
+        if config.process_noise_mode == "learned":
+            noise = nn.Parameter(torch.empty(M, S))
+            noise._no_weight_decay = True
+            self.register_parameter(p_name, noise)
         else:
-            self.register_buffer("process_noise", torch.empty(M, S))
+            self.register_buffer(p_name, torch.empty(M, S))
+
+        self.obs_noise_bias = None
+        if config.obs_noise_init is not None:
+            r0 = self._obs_noise_r0()
+            if not math.isfinite(r0) or r0 <= config.obs_var_min:
+                raise ValueError("obs_noise_init must be finite and above obs_var_min")
+            if config.obs_var_max is not None and r0 > config.obs_var_max:
+                raise ValueError("obs_noise_init must not exceed obs_var_max")
+            self.obs_noise_bias = nn.Parameter(torch.empty(M))
+            self.obs_noise_bias._no_weight_decay = True
 
         if config.use_lambda_skip:
             if config.lambda_skip_mode == "vector":
@@ -141,11 +171,49 @@ class KLALayer(nn.Module):
             inv_softplus_dt_init((M, S), cfg.dt_min, cfg.dt_max, cfg.dt_init_floor)
         )
         self.lambda_log.zero_()
-        self.process_noise.fill_(
-            0.0 if cfg.zero_process_noise else cfg.process_noise_scale
-        )
+        if cfg.process_noise_mode == "zero":
+            if self._p_log_param:
+                self.p_log.zero_()  # Unused finite buffer in explicit zero-noise mode.
+            else:
+                self.process_noise.zero_()
+        else:
+            if cfg.process_noise_init == "heuristic":
+                delta = F.softplus(self.delta.float()) + 1e-7
+                p0 = 3.0 * self.lambda_log.float().exp() * delta
+            else:
+                p0 = torch.full_like(self.delta, cfg.process_noise_init)
+            if self._p_log_param:
+                self.p_log.copy_(p0.log())
+            else:
+                self.process_noise.copy_(p0)
+        self._reset_obs_noise_head()
         if self.lambda_skip is not None:
             self.lambda_skip.fill_(cfg.lambda_skip_init)
+
+    def _obs_noise_r0(self):
+        value = self.config.obs_noise_init
+        return 1.0 / self.d_state if value == "auto" else float(value)
+
+    @torch.no_grad()
+    def _reset_obs_noise_head(self):
+        """Start with constant variance; preserve the cold start in model init."""
+        if self.obs_noise_bias is None:
+            return
+        target = self._obs_noise_r0() - self.config.obs_var_min
+        self.obs_noise_bias.fill_(target + math.log(-math.expm1(-target)))
+        if self.var_expand is not None:
+            self.var_expand.weight.zero_()
+            self.var_expand.weight._no_reinit = True
+            if self.var_expand.bias is not None:
+                self.var_expand.bias.zero_()
+                self.var_expand.bias._no_reinit = True
+        else:
+            lo, hi = self._w_value, self._w_value + self._w_var
+            self.sensor_proj.weight[lo:hi].zero_()
+            self.sensor_proj.weight._no_reinit = True
+            if self.sensor_proj.bias is not None:
+                self.sensor_proj.bias[lo:hi].zero_()
+                self.sensor_proj.bias._no_reinit = True
 
     # ------------------------------------------------------------------ state
 
@@ -164,8 +232,14 @@ class KLALayer(nn.Module):
     def _continuous_params(self):
         """Continuous-time (raw) dynamics: transition a and process noise p."""
         a = -torch.exp(self.lambda_log.float())  # [M, S], strictly negative
+        if self._p_log_param:
+            p = (torch.zeros_like(self.p_log, dtype=torch.float32)
+                 if self.config.process_noise_mode == "zero" else self.p_log.float().exp())
+            if self.config.clip_value is not None:
+                p = p.clamp_max(self.config.clip_value)
+            return a, p
         p = self.process_noise.float()
-        if self.config.zero_process_noise:
+        if self.config.process_noise_mode == "zero":
             p = p + 1e-12
         else:
             p = p.clamp_min(1e-7)
@@ -213,6 +287,8 @@ class KLALayer(nn.Module):
             v = self.value_expand(v)
         if self.var_expand is not None:
             log_sigma_v = self.var_expand(log_sigma_v)
+        if self.obs_noise_bias is not None:
+            log_sigma_v = log_sigma_v + self.obs_noise_bias
 
         if cfg.qk_norm:
             k = l2_norm(k)
