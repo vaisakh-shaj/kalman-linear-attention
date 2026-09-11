@@ -84,7 +84,7 @@ def _fused_fwd_kernel(
     # Static dynamics are loop-invariant, so hoist them out of the chunk loop.
     a_st = tl.load(a_ptr + m * S + s, mask=s_mask, other=1.0)
     q_st = tl.load(q_ptr + m * S + s, mask=s_mask, other=0.0)
-    a2_st = a_st * a_st
+    a2_st = tl.maximum(a_st * a_st, 1e-12)
 
     cA = tl.zeros([BLOCK_S], tl.float32) + 1.0
     cB = tl.zeros([BLOCK_S], tl.float32)
