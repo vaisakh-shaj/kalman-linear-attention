@@ -50,7 +50,7 @@ _NVCC_FLAGS = [
     "-std=c++17",
     "--use_fast_math",
     # cu13 toolchains commonly mix nvcc and cccl/runtime header minor versions
-    # (e.g. nvcc 13.2 against torch's bundled cu13.0 redist) — skip CCCL's
+    # (e.g. nvcc 13.2 against torch's bundled cu13.0 redist) - skip CCCL's
     # CTK-version compat assertion, which only guards header/compiler skew.
     "-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK",
     "-U__CUDA_NO_HALF_OPERATORS__",
@@ -77,7 +77,7 @@ def _extra_include_paths(version: str) -> list[str]:
     """Include dirs the build needs beyond CUDA_HOME.
 
     torch's extension headers pull in cusparse/cublas/… ; the matching redist
-    headers ship with the torch wheel (the system CUDA toolkit — e.g. nix's —
+    headers ship with the torch wheel (the system CUDA toolkit - e.g. nix's -
     often omits them) under ``site-packages/nvidia/*/include``. Whatever is there
     belongs to the torch that is installed, so take all of it and do not inspect
     versions. CUDA 13 also moved the cub/cccl headers under
@@ -92,6 +92,24 @@ def _extra_include_paths(version: str) -> list[str]:
         if os.path.isdir(cccl):
             paths.append(cccl)
     return paths
+
+
+def _cuda_setup_help() -> str:
+    return (
+        "KLA's CUDA backend compiles kernels on first use. PyTorch's CUDA "
+        "runtime alone is not enough; a CUDA toolkit (nvcc) and compatible "
+        "C++ compiler are also required.\n"
+        f"PyTorch: {torch.__version__}; CUDA build: {torch.version.cuda}.\n"
+        "Install/load a toolkit matching this CUDA build and a compatible "
+        "compiler. On a cluster, use your site's CUDA and compiler modules.\n"
+        "If discovery fails, set CUDA_HOME to the toolkit directory containing "
+        "bin/nvcc. Restart Python after changing the environment.\n"
+        "Then run: python -m kla --test-backends cuda_v3_fast\n"
+        "For easier setup, use backend='auto' (Triton on supported NVIDIA "
+        "systems), or backend='torch' for the portable reference.\n"
+        "Setup: https://github.com/vaisakh-shaj/kalman-linear-attention/"
+        "blob/main/docs/backends.md#cuda-setup"
+    )
 
 
 @functools.cache
@@ -116,20 +134,38 @@ def _load_extension(version: str = DEFAULT_KERNEL_VERSION):
     )
     if not sources:
         raise NotImplementedError(
-            f"No CUDA kernel sources found under {csrc} — "
+            f"No CUDA kernel sources found under {csrc} - "
             "use backend='torch' or 'triton'."
         )
 
-    from torch.utils.cpp_extension import load
+    from torch.utils import cpp_extension
 
-    return load(
-        name=f"kla_matmul_scan_cuda_{version}",
-        sources=sources,
-        extra_cuda_cflags=_nvcc_flags(version),
-        extra_cflags=["-O3", "-std=c++17"],
-        extra_include_paths=_extra_include_paths(version),
-        verbose=os.environ.get("KLA_JIT_VERBOSE", "0") == "1",
-    )
+    # Check the toolkit PyTorch will actually use, including its cached discovery.
+    cuda_home = cpp_extension.CUDA_HOME
+    if not cuda_home:
+        raise RuntimeError("KLA CUDA toolkit was not found.\n" + _cuda_setup_help())
+    nvcc = os.path.join(cuda_home, "bin", "nvcc")
+    if not os.path.isfile(nvcc):
+        raise RuntimeError(
+            f"KLA CUDA compiler was not found at {nvcc}.\n" + _cuda_setup_help()
+        )
+
+    try:
+        return cpp_extension.load(
+            name=f"kla_matmul_scan_cuda_{version}",
+            sources=sources,
+            extra_cuda_cflags=_nvcc_flags(version),
+            extra_cflags=["-O3", "-std=c++17"],
+            extra_include_paths=_extra_include_paths(version),
+            verbose=os.environ.get("KLA_JIT_VERBOSE", "0") == "1",
+        )
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError(
+            "KLA CUDA extension could not be built or loaded.\n"
+            + _cuda_setup_help()
+            + "\nSet KLA_JIT_VERBOSE=1 for build diagnostics. "
+            "The original error is shown above."
+        ) from exc
 
 
 def _to_cuda_scan_layout(x: torch.Tensor) -> torch.Tensor:
@@ -204,7 +240,7 @@ def kla_scan_cuda(
     """CUDA KLA scan. Same return contract as :func:`kla.ops.kla_scan_torch`,
     except the final state is ``None`` (the kernel is forward/training only).
 
-    ``kernel_version`` selects between the shipped kernels — see the module
+    ``kernel_version`` selects between the shipped kernels - see the module
     docstring. Defaults to ``v3_fast``; legacy versions remain selectable.
     """
     if not v.is_cuda:
@@ -230,7 +266,7 @@ def kla_scan_cuda(
     a = a.float()
     # Floor the process noise exactly as _broadcast_ap does for the torch path.
     # The kernel has no internal guard, so a non-positive p makes (a² + p·λ) cross
-    # zero and the Möbius recursion diverge to NaN -- where torch/triton would
+    # zero and the Möbius recursion diverge to NaN - where torch/triton would
     # stay finite on the same input.
     p = p.float().clamp_min(P_MIN)
 

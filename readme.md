@@ -24,19 +24,35 @@ the model's own uncertainty, so it feeds back into the mean.
 
 ## Install
 
+Use either installation method below with [uv](https://docs.astral.sh/uv/).
+The commands create a virtual environment and activate it so `python` uses
+that environment.
+
 **PyPI:**
 ```bash
-uv pip install kla    # or: uv add kla
+uv venv
+source .venv/bin/activate
+uv pip install kla
 ```
 
 **From source:**
 ```bash
-git clone https://github.com/vaisakh-shaj/kalman-linear-attention.git kla
-uv pip install ./kla
+git clone https://github.com/vaisakh-shaj/kalman-linear-attention.git
+cd kalman-linear-attention
+uv venv
+source .venv/bin/activate
+uv pip install .
 ```
 
+If you already cloned the repository, enter its directory and skip the clone
+command. In each new shell, run `source .venv/bin/activate` from the directory
+containing `.venv` before using `python`; you only need to create the environment
+once.
+
 The CUDA backend compiles on first use and requires a compatible CUDA toolkit
-and C++ compiler. See [CUDA setup](docs/backends.md#cuda-setup).
+and C++ compiler, even if PyTorch already runs on your GPU. If `CUDA_HOME` or
+`nvcc` is missing, install/load the toolkit before starting Python; see
+[CUDA setup](docs/backends.md#cuda-setup) for commands and troubleshooting.
 
 Runs on CPU, NVIDIA GPUs and Apple silicon out of the box. To see what this
 machine will use:
@@ -45,7 +61,26 @@ machine will use:
 python -m kla --check-backends
 ```
 
-For backend selection and CUDA setup, see [the backend guide](docs/backends.md).
+### Supported backends
+
+KLA supports CPU, NVIDIA GPUs and Apple silicon. Speed comparisons below
+refer to NVIDIA GPU training.
+
+| Backend | Hardware and setup | Training speed | Training memory |
+| --- | --- | --- | --- |
+| `torch` | CPU, NVIDIA and Apple; standard PyTorch, easy to read and modify | Slow reference implementation | High: materializes expanded scan intermediates |
+| `triton` | NVIDIA; easy setup with CUDA-enabled PyTorch and Triton | Faster than Torch | High: materializes expanded scan intermediates |
+| `cuda` | NVIDIA; compatible CUDA toolkit and C++ compiler | Fastest in the paper's benchmarks; substantially faster than Triton | Much smaller scan-memory footprint |
+| `mps` | Apple silicon; MPS-enabled PyTorch with Metal shader support | Fast, fused Metal kernels | Small scan-memory footprint: chunk checkpoints and recomputation |
+
+We used the CUDA backend for our large-scale pretraining experiments on billions
+of tokens with long sequence lengths.
+It follows the same memory-saving principle as [Mamba's fused scan](https://arxiv.org/abs/2312.00752).
+
+Use `backend="cuda"` for NVIDIA GPU training performance, or `backend="auto"`
+for easier setup. For tensors on the corresponding device, `auto` selects Triton
+on NVIDIA GPUs or MPS on Apple silicon when those kernels are available,
+and Torch otherwise. See [backend details and setup](docs/backends.md).
 
 ## Structure
 
@@ -54,25 +89,10 @@ This repository is split in two parts:
 - (Coming Soon) `experiments/` + `main.py` (with `nanochat/` and `mad/` submodules): Non-package code to reproduce the papers experiments.
 
 The ancillary parts are:
-- `docs/`: General documentation — [usage](docs/usage.md), [backends](docs/backends.md).
+- `docs/`: General documentation - [usage](docs/usage.md), [backends](docs/backends.md).
 - `tests/`: Unit tests for the package.
 
 ### Package
-
-The default is the **Mamba-style block**, used for pretraining for parameter
-efficiency: values come directly from the conv stream, and observation variance
-uses a low-rank projection. Our MAD experiments use the **plain block**, with
-full value and variance projections. Both configurations use the same Kalman scan.
-
-```python
-from kla import KLAConfig
-
-KLAConfig()  # default: value_rank="conv", var_rank="auto"
-KLAConfig(value_rank="full", var_rank="full")  # plain block for MAD
-```
-
-For existing checkpoints, use the projection settings and ranks they were trained
-with; older default models used full projections.
 
 ```python
 import torch
@@ -81,10 +101,12 @@ from kla import KLAConfig, KLALayer, ModelConfig, SequenceModel
 layer = KLALayer(d_model=512, config=KLAConfig(d_state=16))
 y = layer(torch.randn(2, 1024, 512))
 
-# stateful prefill + O(1) decode
-state = layer.init_state(batch=2)
-y, state = layer(torch.randn(2, 1024, 512), state=state)  # prefill
-y, state = layer(torch.randn(2, 1, 512), state=state)  # decode one token
+# Inference after training: stateful prefill + O(1) per-token decode
+layer.eval()
+with torch.inference_mode():
+    state = layer.init_state(batch=2)
+    y, state = layer(torch.randn(2, 1024, 512), state=state)  # prefill
+    y, state = layer(torch.randn(2, 1, 512), state=state)  # decode one token
 
 # a full language model
 model = SequenceModel(
@@ -93,11 +115,8 @@ model = SequenceModel(
 logits = model(torch.randint(0, 50304, (2, 256)))
 ```
 
-**For training on NVIDIA GPUs, install KLA using the instructions above and
-follow [CUDA setup](docs/backends.md#cuda-setup), then set `backend="cuda"`.**
-This selects the latest supported CUDA kernel included in your installed KLA
-release; you do not need to choose a kernel version. For easier setup, keep
-`backend="auto"`.
+For NVIDIA GPU training, select `backend="cuda"` after completing
+[CUDA setup](docs/backends.md#cuda-setup):
 
 ```python
 layer = KLALayer(
@@ -111,6 +130,23 @@ CUDA currently supports static dynamics with `d_state <= 64` and does not return
 the filter state. Use `auto` for stateful prefill and decoding, as above.
 
 Full API, config reference and the two published blocks: [docs/usage.md](docs/usage.md).
+
+<details>
+<summary>Block configurations: pretraining and MAD</summary>
+
+The default is the **Mamba-style block**, used for pretraining for parameter
+efficiency: values come directly from the conv stream, and observation variance
+uses a low-rank projection. Our MAD experiments use the **plain block**, with
+full value and variance projections. Both configurations use the same Kalman scan.
+
+```python
+from kla import KLAConfig
+
+KLAConfig()  # default: value_rank="conv", var_rank="auto"
+KLAConfig(value_rank="full", var_rank="full")  # plain block for MAD
+```
+
+</details>
 
 ### Experiments
 
